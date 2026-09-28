@@ -156,7 +156,7 @@ def print_agent_steps(new_messages) -> None:
     主循环里调用：显示这一轮 Agent 新增的中间过程（thinking、文本、工具调用、工具返回）。
     """
     # 两层遍历分别处理消息和消息中的内容片段，顺序沿用框架返回的历史顺序。
-    # main.py 在 run_sync() 完成后调用它，因此这不是实时流式展示。
+    # 这是已有消息的批量展示辅助函数；实时执行由 main.run_agent() 调用 print_part()。
     for msg in new_messages:
         for part in msg.parts:
             # 主循环里不重复显示用户刚刚输入的内容

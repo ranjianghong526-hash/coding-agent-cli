@@ -2,7 +2,7 @@
 Agent 组装层：把模型连接、工作要求、工具和调用记录功能拼成一个实例。
 
 本模块在 import 时执行配置，因此 .env 和 API_KEY 必须在创建模型前准备好。
-它只配置 Agent；真正开始处理用户需求的是 main.py 中的 agent.run_sync()。
+它只配置 Agent；真正开始处理用户需求的是 main.py 中驱动 agent.iter() 的 run_agent()。
 """
 import os
 from pathlib import Path

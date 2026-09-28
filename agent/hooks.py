@@ -1,7 +1,7 @@
 """
 挂在 Agent 上的 hooks，用来抓每次 model API 调用的元数据。
 
-主循环在每轮 run_sync 之前清空 api_call_log，跑完后快照到 SessionState 里，
+主循环在每轮 run_agent 之前清空 api_call_log，跑完后快照到 SessionState 里，
 /api-detail 命令再把这一轮的所有调用展示给用户。
 
 hook（钩子）是框架在指定时机自动调用的函数：这里在请求前后各记录一次。
@@ -36,7 +36,7 @@ class ApiCall:
     output_tokens: int = 0
 
 
-# 主循环在每轮 run_sync 之前清空它
+# 主循环在每轮 run_agent 之前清空它
 # 全局列表用于当前串行 CLI；若改成同时执行多个任务，需要按任务隔离记录。
 api_call_log: list[ApiCall] = []
 

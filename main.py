@@ -1,8 +1,12 @@
 """命令行入口：把终端输入、Agent 执行和结果展示串成完整的一轮交互。
 
 推荐先读 main() 建立全貌，再沿着它调用的三个函数往下看。
-这里的 while 循环负责多轮对话；模型与工具之间的反复调用由 Pydantic AI 管理。
+这里的 while 循环负责多轮对话；通过 agent.iter() 在节点之间展示模型和工具结果。
 """
+
+import asyncio
+
+from pydantic_ai import Agent, FunctionToolResultEvent
 
 # prompt_toolkit 负责输入体验，模型判断与工具执行不由它处理。
 from prompt_toolkit import PromptSession
@@ -15,7 +19,7 @@ from ui.commands import (
     COMMANDS,
     SessionState,
     console,
-    print_agent_steps,
+    print_part,
     print_divider,
     print_welcome_banner,
 )
@@ -24,14 +28,15 @@ from ui.commands import (
 prompt_session = PromptSession()
 
 
-def read_user_input():
+async def read_user_input():
     """
     打印上横线并读一行用户输入；回车后再补一条下横线，让输入在滚动历史里保持上下边界。返回 None 表示用户希望退出（Ctrl-C / Ctrl-D）。
     """
     print_divider()
     try:
         # 去掉首尾空白；空输入会由 main() 跳过，不会发送给模型。
-        user_input = prompt_session.prompt("❯ ").strip()
+        # main() 已运行在事件循环中，使用异步输入，避免同步 prompt() 嵌套事件循环。
+        user_input = (await prompt_session.prompt_async("❯ ")).strip()
     except (EOFError, KeyboardInterrupt):
         # 将 Ctrl-D / Ctrl-C 统一转换成 None，主循环据此退出。
         print()
@@ -64,23 +69,48 @@ def handle_command(user_input, state):
 
 def apply_result(state, result):
     """
-    跑完一轮 Agent 后，把结果同步到 SessionState 并显示新增的中间过程。
+    跑完一轮 Agent 后保存历史、用量和调用日志；过程已在执行期间显示。
     """
     # 完整历史包含之前的对话和本轮新增消息，还包括工具请求与工具返回。
     # 下一轮传给模型时，它才能理解“继续修改刚才的文件”这类上下文。
     state.history = result.all_messages()
     # 一轮需求可能触发多次模型请求；这里累计的是整轮的 token 用量。
-    usage = result.usage()
+    # SDK 旧版本提供 usage()，新版本提供 usage 属性；依赖未锁版本，兼容两种接口。
+    usage = result.usage
+    usage = usage() if callable(usage) else usage
     state.input_tokens += usage.input_tokens
     state.output_tokens += usage.output_tokens
     # 复制列表，避免下一轮 api_call_log.clear() 连带清空上轮保存的列表。
     # 这是浅复制：ApiCall 对象仍共享，但当前串行流程在本轮结束后不再修改它们。
     state.last_api_calls = list(api_call_log)
-    # result.new_messages() 直接拿到这一轮新增的 message，不需要手动算偏移
-    print_agent_steps(result.new_messages())
 
 
-def main():
+async def run_agent(user_input: str, state: SessionState):
+    """逐节点执行一轮任务，模型返回和工具完成时立刻复用现有 UI 展示。
+
+    iter() 返回异步上下文管理器；节点中的模型请求和工具操作仍由框架执行。
+    此处展示完整响应片段，没有消费逐 token 的模型流。
+    """
+    async with agent.iter(user_input, message_history=state.history) as agent_run:
+        async for node in agent_run:
+            if Agent.is_model_request_node(node):
+                # 这个节点尚未执行，下一次迭代才发出模型请求。
+                console.print("[dim]✻ 正在请求模型…[/]")
+            elif Agent.is_call_tools_node(node):
+                # 模型响应已经返回，但工具尚未执行；先展示正文、思考和工具参数。
+                for part in node.model_response.parts:
+                    print_part(part)
+                # 消费工具事件：每个工具返回时立即显示，不等全部工具或整轮结束。
+                # stream() 执行这个节点；后续迭代会使用已执行的结果，不重复跑工具。
+                async with node.stream(agent_run.ctx) as events:
+                    async for event in events:
+                        if isinstance(event, FunctionToolResultEvent):
+                            print_part(event.part)
+        # 最终结果与原同步执行一样提供完整历史和本轮用量。
+        return agent_run.result
+
+
+async def main():
     """维护一份会话状态，持续接收用户输入，直到命令或输入信号要求退出。"""
     # 状态只在内存中存活；程序退出后不会自动保存到磁盘。
     state = SessionState(model_name=MODEL_NAME)
@@ -88,7 +118,7 @@ def main():
 
     while True:
         # 读用户输入
-        user_input = read_user_input()
+        user_input = await read_user_input()
         if user_input is None:
             # None 表示退出；空字符串表示只按了回车，二者含义不同。
             break
@@ -104,12 +134,13 @@ def main():
 
         # 日志按“本轮需求”收集：清空旧日志，再让请求前后的 hooks 写入新日志。
         api_call_log.clear()
-        # 同步执行会阻塞当前输入循环。框架负责模型请求、工具调用与结果回传。
-        # 这里没有流式输出；本轮完成后才由 apply_result() 展示消息。
-        result = agent.run_sync(user_input, message_history=state.history)
+        # await 等待本轮完成，run_agent() 会在等待期间逐步展示执行结果。
+        # 外层仍按顺序处理用户输入，不同时运行多个任务。
+        result = await run_agent(user_input, state)
         apply_result(state, result)
 
 
 # 直接执行 python main.py 时启动交互；被其他模块导入时不自动进入主循环。
 if __name__ == "__main__":
-    main()
+    # 创建事件循环来执行 async main()，程序退出时关闭事件循环。
+    asyncio.run(main())

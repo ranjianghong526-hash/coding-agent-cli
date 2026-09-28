@@ -1,6 +1,7 @@
 """
-终端 UI 层：渲染原语（render）、斜杠命令（commands），以及输入区（input_ui，部分版本才有）。
+终端 UI 包：render 提供基础展示组件，commands 维护会话、处理命令并展示消息。
 
-直接从子模块导入（ui.render / ui.commands / ...）。这个 __init__ 故意不做任何重导出：
-render 是连非 UI 模块（如 permissions、agent.hooks）也依赖的最底层原语，在这里重导出 commands 可能经由它们形成循环导入。
+本文件标识 ui 是一个普通 Python 包，没有初始化业务或重导出其他对象。
+调用方直接从 ui.render 或 ui.commands 导入所需函数，方便看清依赖来自哪里。
+当前依赖方向为 commands -> render，render 不反过来导入 commands。
 """

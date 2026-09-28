@@ -61,7 +61,7 @@ class RealtimeOutputTests(unittest.IsolatedAsyncioTestCase):
         state = SessionState(model_name="test-model")
         api_call_log.clear()
         with patch.object(models, "ALLOW_MODEL_REQUESTS", False):
-            with patch.object(main, "agent", test_agent), patch.object(main, "console", Mock()):
+            with patch.object(main, "agent", test_agent), patch.object(main, "console", Mock()), patch.object(main, "save_session"):
                 with patch.object(main, "print_part", side_effect=displayed.append):
                     result = await main.run_agent("读取测试内容", state)
                     self.assertEqual(result.output, "读取完成")

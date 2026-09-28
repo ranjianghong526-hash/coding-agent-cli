@@ -5,7 +5,11 @@ COMMANDS 注册表供 main.py 查找命令，本模块不直接向大模型发�
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
+from uuid import uuid4
+
+from prompt_toolkit import PromptSession
+from session_store import list_sessions, load_session, save_session
 
 from rich.markdown import Heading, Markdown
 from rich.markup import escape
@@ -47,6 +51,9 @@ class SessionState:
     model_name: str = ""
     # 最近一轮 user input 触发的所有 model API 调用记录
     last_api_calls: list = field(default_factory=list)
+    # 每个新会话使用独立文件；saved_messages 标记已成功落盘的消息数量。
+    session_id: str = field(default_factory=lambda: uuid4().hex)
+    saved_messages: int = 0
 
 
 @dataclass
@@ -57,7 +64,8 @@ class Command:
     description: str
     # handler 返回 False 表示主循环应当退出
     # Callable 描述函数类型；引号中的 SessionState 是类型名称的字符串写法。
-    handler: Callable[["SessionState"], bool]
+    # /resume 需要异步等待选择，其他命令仍可直接返回 bool。
+    handler: Callable[["SessionState"], bool | Awaitable[bool]]
 
 
 def print_divider() -> None:
@@ -185,11 +193,15 @@ def cmd_new(state: SessionState) -> bool:
     """
     开启新会话：清空历史、token 计数、API 调用记录。
     """
-    # 只清空内存中的会话信息，不删除工具之前写入的文件，也不重建 Agent。
+    # 切换前补存尚未写入的历史；失败则不清空状态，避免丢失可继续保存的内容。
+    save_session(state)
+    # 只切换当前会话，旧 JSONL 文件和工具写入的文件都保留。
     state.history.clear()
     state.input_tokens = 0
     state.output_tokens = 0
     state.last_api_calls.clear()
+    state.session_id = uuid4().hex
+    state.saved_messages = 0
     console.print("已开启新会话\n")
     return True
 
@@ -197,10 +209,50 @@ def cmd_new(state: SessionState) -> bool:
 def cmd_status(state: SessionState) -> bool:
     """展示当前会话的本地统计，读取这些数据不需要调用模型接口。"""
     # 历史条数不是用户提问次数，一轮需求可能产生多条模型和工具消息。
+    console.print(f"会话编号：       {state.session_id}")
     console.print(f"模型：           {state.model_name}")
     console.print(f"历史消息条数：    {len(state.history)}")
     console.print(f"累计输入 tokens：{state.input_tokens}")
     console.print(f"累计输出 tokens：{state.output_tokens}\n")
+    return True
+
+
+async def cmd_resume(state: SessionState) -> bool:
+    """按编号选择项目中的历史会话，校验完成后一次性替换当前内存状态。"""
+    sessions, unreadable = list_sessions()
+    for name in unreadable:
+        console.print(f"跳过无法读取的会话：{name}", style="yellow", markup=False)
+    if not sessions:
+        console.print("当前项目还没有已保存的会话。\n")
+        return True
+    console.print("历史会话（最近更新的在前）：")
+    for index, session in enumerate(sessions, 1):
+        updated = session.updated_at.astimezone().strftime("%Y-%m-%d %H:%M")
+        console.print(f"  {index}. {updated}  {session.title}  [{session.session_id[:8]}]", markup=False)
+    try:
+        # 复用现有输入依赖，不引入新的选择菜单库；空输入或 q 表示取消。
+        choice = (await PromptSession().prompt_async("选择会话编号（回车或 q 取消）：")).strip()
+    except (EOFError, KeyboardInterrupt):
+        console.print("已取消恢复。\n")
+        return True
+    if not choice or choice.lower() == "q":
+        return True
+    if not choice.isdecimal() or not 1 <= int(choice) <= len(sessions):
+        console.print("编号无效，当前会话未改变。\n")
+        return True
+    selected = sessions[int(choice) - 1]
+    # 恢复前先补存当前会话；保存失败时仍保留当前状态，不贸然切换。
+    save_session(state)
+    # 列表展示之后当前会话可能刚补存过，重新加载才能拿到最新完整历史。
+    selected = load_session(selected.session_id)
+    state.history = selected.history
+    state.session_id = selected.session_id
+    state.saved_messages = len(selected.history)
+    state.input_tokens = selected.input_tokens
+    state.output_tokens = selected.output_tokens
+    state.last_api_calls.clear()
+    # 模型继续使用当前 core.py 配置；不因历史文件而偷偷切换模型。
+    console.print(f"已恢复会话 {selected.session_id}，共 {len(selected.history)} 条消息。\n")
     return True
 
 
@@ -240,6 +292,7 @@ def cmd_api_detail(state: SessionState) -> bool:
 # 添加命令时定义 cmd_* 函数并在此注册，main.py 的分发逻辑通常无需修改。
 COMMANDS = {
     "new": Command("new", "开启新会话", cmd_new),
+    "resume": Command("resume", "选择并恢复当前项目的历史会话", cmd_resume),
     "status": Command("status", "显示当前会话状态", cmd_status),
     "api-detail": Command("api-detail", "显示最近一轮 model API 调用详情", cmd_api_detail),
     "help": Command("help", "显示可用命令", cmd_help),

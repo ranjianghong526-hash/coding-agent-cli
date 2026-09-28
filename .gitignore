@@ -10,3 +10,4 @@ venv/
 .ruff_cache/
 .vscode
 .venv
+.sessions/

@@ -5,6 +5,9 @@
 """
 
 import asyncio
+from inspect import isawaitable
+
+from session_store import save_session
 
 from pydantic_ai import Agent, FunctionToolResultEvent
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
@@ -46,7 +49,7 @@ async def read_user_input():
     return user_input
 
 
-def handle_command(user_input, state):
+async def handle_command(user_input, state):
     """
     处理以 / 开头的命令。
     返回 'pass'：不是命令，主循环继续往下走交给 Agent；
@@ -68,7 +71,11 @@ def handle_command(user_input, state):
         console.print(f"未知命令：/{cmd_name}，输入 /help 查看可用命令\n")
         return "continue"
     # handler 的 bool 返回值是统一约定：True 继续接收输入，False 退出。
-    return "continue" if command.handler(state) else "break"
+    result = command.handler(state)
+    if isawaitable(result):
+        # 只有异步命令需要 await；原有同步命令沿用原来的返回约定。
+        result = await result
+    return "continue" if result else "break"
 
 
 def apply_result(state, result):
@@ -87,6 +94,16 @@ def apply_result(state, result):
     # 复制列表，避免下一轮 api_call_log.clear() 连带清空上轮保存的列表。
     # 这是浅复制：ApiCall 对象仍共享，但当前串行流程在本轮结束后不再修改它们。
     state.last_api_calls = list(api_call_log)
+    try:
+        # 每轮成功后持久化新增历史；保存失败不把已完成的模型任务误判为执行失败。
+        save_session(state)
+    except Exception as error:
+        # 存储边界的最后防线：明确提示未落盘，内存历史仍可继续使用或下轮补存。
+        console.print(
+            f"本轮已完成，但会话保存失败（{type(error).__name__}）。"
+            "历史仍在内存中，请检查磁盘权限或空间；下轮会再次尝试保存。",
+            style="yellow", markup=False,
+        )
 
 
 async def run_agent(user_input: str, state: SessionState):
@@ -137,7 +154,7 @@ def print_run_error(error: Exception) -> None:
 
 async def main():
     """维护一份会话状态，持续接收用户输入，直到命令或输入信号要求退出。"""
-    # 状态只在内存中存活；程序退出后不会自动保存到磁盘。
+    # 默认启动新会话；每轮成功后保存到磁盘，需要旧历史时输入 /resume。
     state = SessionState(model_name=MODEL_NAME)
     print_welcome_banner("Coding Agent")
 
@@ -154,7 +171,7 @@ async def main():
             # 先清空临时日志，防止本地命令抛错时把上一轮用量再次累计。
             api_call_log.clear()
             # /new、/status 等命令在本地完成，不触发模型请求。
-            action = handle_command(user_input, state)
+            action = await handle_command(user_input, state)
             if action == "break":
                 break
             if action == "continue":

@@ -127,7 +127,7 @@ class AgentErrorTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(main, "read_user_input", AsyncMock(side_effect=["fail", "/status", "succeed", "/exit"])):
                 with patch.object(main, "run_agent", AsyncMock(side_effect=execute)) as run:
                     with patch.object(main, "print_welcome_banner"), patch.object(main, "console", Mock()) as console:
-                        with patch.object(commands, "console", Mock()):
+                        with patch.object(commands, "console", Mock()), patch.object(main, "save_session"):
                             await main.main()
         self.assertEqual(run.await_count, 2)
         self.assertEqual(state.history, ["next successful history"])
@@ -138,7 +138,7 @@ class AgentErrorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_empty_slash_and_user_cancellation(self):
         with patch.object(main, "console", Mock()):
-            self.assertEqual(main.handle_command("/", SessionState()), "continue")
+            self.assertEqual(await main.handle_command("/", SessionState()), "continue")
             with patch.object(main, "read_user_input", AsyncMock(return_value="run")):
                 with patch.object(main, "run_agent", AsyncMock(side_effect=asyncio.CancelledError)) as run:
                     with patch.object(main, "print_welcome_banner"):

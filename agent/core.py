@@ -18,6 +18,7 @@ from pydantic_ai.providers.deepseek import DeepSeekProvider
 # 点号表示从当前 agent 包内导入，而不是寻找顶层同名模块。
 from .hooks import hooks
 from .tools import TOOLS
+from permissions import PermissionState
 
 # 固定读取项目根目录的 .env，保留已设置的系统环境变量。
 # __file__ 是当前文件路径；两次 parent 从 agent/core.py 回到项目根目录。
@@ -51,18 +52,21 @@ model = OpenAIChatModel(
 # 同一个 Agent 实例可以执行多轮任务；对话历史由 main.py 显式传入。
 agent = Agent(
     model,
+    # 每轮由主程序传入当前权限状态，执行前 hook 据此进行强制拦截。
+    deps_type=PermissionState,
     # 这是发给模型的工作要求，不是 Python 层面的强制验证机制。
     # 相邻字符串会由 Python 自动拼接成一段完整文本。
     instructions=(
         "你是一个编程助手。你可以读写文件和执行命令来帮用户完成编程任务。\n"
         "工作流程：先理解需求，写代码，然后运行验证。"
         "如果有错误就修复并重新运行，直到确认正确。"
+        "如果工具返回权限拒绝，尊重用户的拒绝和说明，不要换工具绕过。"
     ),
     # 注册后，框架允许模型选择工具并把参数映射为 Python 函数调用。
     tools=TOOLS,
     # 工具参数错误或 ModelRetry 让模型尝试修正，超过上限则交给主循环提示失败。
     # 这与 client.max_retries 的网络重试是两种不同的机制。
     retries=2,
-    # hooks 在每次模型请求前后记账，不负责执行文件或命令操作。
+    # hooks 记录模型调用，并在工具执行前检查权限；实际操作仍由工具函数执行。
     capabilities=[hooks],
 )

@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from prompt_toolkit import PromptSession
 from session_store import list_sessions, load_session, save_session
+from permissions import PermissionState
 
 from rich.markdown import Heading, Markdown
 from rich.markup import escape
@@ -54,6 +55,8 @@ class SessionState:
     # 每个新会话使用独立文件；saved_messages 标记已成功落盘的消息数量。
     session_id: str = field(default_factory=lambda: uuid4().hex)
     saved_messages: int = 0
+    # 权限属于当前程序运行，/new 和 /resume 不重置，也不从 JSONL 恢复授权。
+    permissions: PermissionState = field(default_factory=PermissionState)
 
 
 @dataclass
@@ -211,6 +214,7 @@ def cmd_status(state: SessionState) -> bool:
     # 历史条数不是用户提问次数，一轮需求可能产生多条模型和工具消息。
     console.print(f"会话编号：       {state.session_id}")
     console.print(f"模型：           {state.model_name}")
+    console.print(f"权限模式：       {state.permissions.mode}")
     console.print(f"历史消息条数：    {len(state.history)}")
     console.print(f"累计输入 tokens：{state.input_tokens}")
     console.print(f"累计输出 tokens：{state.output_tokens}\n")

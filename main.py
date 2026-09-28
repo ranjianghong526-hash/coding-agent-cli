@@ -14,6 +14,7 @@ from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 
 # prompt_toolkit 负责输入体验，模型判断与工具执行不由它处理。
 from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
 
 # 导入 agent 包时会执行 agent/__init__.py，并进一步执行 core.py 的模型配置。
 # 因此 API_KEY 校验发生在进入 main() 之前。
@@ -32,7 +33,19 @@ from ui.commands import (
 prompt_session = PromptSession()
 
 
-async def read_user_input():
+def permission_key_bindings(state: SessionState) -> KeyBindings:
+    """仅在主输入区绑定快捷键，审批输入不会意外切换权限模式。"""
+    bindings = KeyBindings()
+
+    @bindings.add("s-tab")
+    def switch_mode(event):
+        state.permissions.cycle_mode()
+        event.app.invalidate()
+
+    return bindings
+
+
+async def read_user_input(state: SessionState | None = None):
     """
     打印上横线并读一行用户输入；回车后再补一条下横线，让输入在滚动历史里保持上下边界。返回 None 表示用户希望退出（Ctrl-C / Ctrl-D）。
     """
@@ -40,7 +53,11 @@ async def read_user_input():
     try:
         # 去掉首尾空白；空输入会由 main() 跳过，不会发送给模型。
         # main() 已运行在事件循环中，使用异步输入，避免同步 prompt() 嵌套事件循环。
-        user_input = (await prompt_session.prompt_async("❯ ")).strip()
+        options = {} if state is None else {
+            "key_bindings": permission_key_bindings(state),
+            "bottom_toolbar": lambda: f"权限：{state.permissions.mode}  |  Shift+Tab 切换模式",
+        }
+        user_input = (await prompt_session.prompt_async("❯ ", **options)).strip()
     except (EOFError, KeyboardInterrupt):
         # 将 Ctrl-D / Ctrl-C 统一转换成 None，主循环据此退出。
         print()
@@ -112,7 +129,7 @@ async def run_agent(user_input: str, state: SessionState):
     iter() 返回异步上下文管理器；节点中的模型请求和工具操作仍由框架执行。
     此处展示完整响应片段，没有消费逐 token 的模型流。
     """
-    async with agent.iter(user_input, message_history=state.history) as agent_run:
+    async with agent.iter(user_input, message_history=state.history, deps=state.permissions) as agent_run:
         async for node in agent_run:
             if Agent.is_model_request_node(node):
                 # 这个节点尚未执行，下一次迭代才发出模型请求。
@@ -160,7 +177,7 @@ async def main():
 
     while True:
         # 读用户输入
-        user_input = await read_user_input()
+        user_input = await read_user_input(state)
         if user_input is None:
             # None 表示退出；空字符串表示只按了回车，二者含义不同。
             break

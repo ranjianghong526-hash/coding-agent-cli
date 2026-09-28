@@ -23,6 +23,7 @@ with patch.dict(os.environ, {"API_KEY": "test-placeholder"}):
 from agent.hooks import api_call_log, hooks
 from ui import commands
 from ui.commands import SessionState
+from permissions import PermissionState
 
 
 class RealtimeOutputTests(unittest.IsolatedAsyncioTestCase):
@@ -58,7 +59,8 @@ class RealtimeOutputTests(unittest.IsolatedAsyncioTestCase):
             )
 
         test_agent = Agent(FunctionModel(respond), tools=[read_demo], capabilities=[hooks])
-        state = SessionState(model_name="test-model")
+        # 此测试只验证展示顺序，自定义测试工具显式放行；审批另有集成测试。
+        state = SessionState(model_name="test-model", permissions=PermissionState(mode="bypass"))
         api_call_log.clear()
         with patch.object(models, "ALLOW_MODEL_REQUESTS", False):
             with patch.object(main, "agent", test_agent), patch.object(main, "console", Mock()), patch.object(main, "save_session"):

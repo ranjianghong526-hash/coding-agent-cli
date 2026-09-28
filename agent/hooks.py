@@ -5,7 +5,7 @@
 /api-detail 命令再把这一轮的所有调用展示给用户。
 
 hook（钩子）是框架在指定时机自动调用的函数：请求前后记录日志，请求失败时补日志，
-工具未知异常时转换为 ModelRetry，让模型有机会修正操作。
+工具执行前审批，工具未知异常时转换为 ModelRetry，让模型有机会修正操作。
 日志只记录模型调用的摘要，没有保存完整的 HTTP 请求体和响应体。
 """
 from dataclasses import dataclass, field
@@ -13,6 +13,9 @@ from typing import Any
 
 from pydantic_ai.capabilities import Hooks
 from pydantic_ai import ModelRetry
+from pydantic_ai.exceptions import SkipToolExecution
+
+from permissions import PermissionState, check_permission
 
 
 # dataclass 根据字段自动生成初始化方法等，适合保存结构明确的一条调用记录。
@@ -44,6 +47,16 @@ api_call_log: list[ApiCall] = []
 
 # 这个对象通过 core.py 的 capabilities=[hooks] 挂到 Agent 上。
 hooks = Hooks()
+
+
+@hooks.on.before_tool_execute
+async def _approve_tool(ctx, *, call, tool_def, args):
+    """参数校验完成、工具尚未执行时审批，拒绝后不会发生文件或命令副作用。"""
+    if not isinstance(ctx.deps, PermissionState):
+        # 调用方必须明确传入权限状态；漏传时不能绕过审批直接执行工具。
+        raise SkipToolExecution("[权限拒绝] 缺少权限上下文，工具未执行。")
+    await check_permission(ctx.deps, call.tool_name, args)
+    return args
 
 
 @hooks.on.before_model_request

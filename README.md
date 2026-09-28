@@ -14,6 +14,7 @@
 - 会话统计：查看累计 token 用量，以及最近一轮模型 API 调用详情。
 - 本地配置：从项目根目录的 `.env` 加载 API Key。
 - 错误恢复：API 请求自动重试，工具错误反馈给模型，本轮失败后 CLI 仍可继续输入。
+- 权限审批：执行前确认工具及完整参数，支持三种模式、临时授权与拒绝说明。
 
 ## 快速开始
 
@@ -80,11 +81,41 @@ API_KEY=你的DeepSeek密钥
 | `/help` | 显示可用命令 |
 | `/new` | 保存当前历史，开启独立的新会话；保留旧会话文件 |
 | `/resume` | 列出当前项目的已保存会话，输入编号恢复 |
-| `/status` | 显示会话编号、模型、历史消息数量和累计 token 用量 |
+| `/status` | 显示会话编号、模型、权限模式、历史消息数量和累计 token 用量 |
 | `/api-detail` | 显示最近一轮每次模型调用的请求与响应摘要 |
 | `/exit` | 退出程序 |
 
 这些命令在本地处理，不触发模型请求。输入阶段也可以使用 Ctrl-C 或 Ctrl-D 退出。
+
+### 工具权限审批
+
+启动时使用 `default` 模式。在主输入区按 **Shift+Tab**，按 `default → acceptEdits → bypass → default` 顺序切换，底部提示栏显示当前模式，`/status` 也可查看。
+
+| 模式 | `read_file` | `write_file` | `run_command` |
+|---|---|---|---|
+| `default` | 自动允许 | 执行前确认 | 执行前确认 |
+| `acceptEdits` | 自动允许 | 自动允许 | 执行前确认 |
+| `bypass` | 自动允许 | 自动允许 | 自动允许 |
+
+新工具默认需要审批，只有明确的只读白名单与文件写入规则自动放行。审批界面完整显示工具参数，例如：
+
+```text
+工具执行需要确认：write_file
+{
+  "path": "1.txt",
+  "content": "你好"
+}
+审批 [默认拒绝] ❯
+```
+
+- 输入 `y` 或 `1`：仅允许这一次。
+- 输入 `a` 或 `2`：本次程序运行中，相同工具名及完整参数不再询问。任意参数变化都需要重新确认，例如写入内容变化或命令附加新操作。
+- 输入 `n` 或 `3`：拒绝；可附说明，如 `n 请先读取文件，不要覆盖`。
+- 回车、Ctrl-C、Ctrl-D：拒绝当前工具调用，Agent 收到拒绝结果后继续处理。
+
+拒绝由执行前 hook 使用 `SkipToolExecution` 拦截，真实工具不会执行，模型收到 `[权限拒绝]` 工具结果；这不会消耗 `ModelRetry` 的修正次数。多个并发调用的审批输入通过锁串行处理。审批区域不绑定模式切换快捷键。
+
+权限模式与临时授权属于本次程序运行：`/new`、`/resume` 保留当前权限设置，不把它们写入聊天记录；重启后重新回到 `default`。权限检查只拦截本 Agent 经 SDK 发起的工具调用，工具函数被其他 Python 代码直接调用时不经过此 hook。它不是操作系统沙箱，也不限制已经允许的 shell 命令内部会执行哪些操作。
 
 ### 保存与恢复聊天
 
@@ -107,11 +138,12 @@ API_KEY=你的DeepSeek密钥
 coding-agent-cli/
 ├── main.py               # 入口、输入循环、命令分流和结果处理
 ├── session_store.py      # JSONL 追加保存、扫描与完整消息恢复
+├── permissions.py        # 三种权限模式、审批输入和本次运行的临时授权
 ├── agent/
 │   ├── __init__.py       # Agent 包的公开接口
 │   ├── core.py           # 加载配置，组装模型、工具和 hooks
 │   ├── tools.py          # 读文件、写文件、执行命令
-│   └── hooks.py          # 模型调用日志，以及未知工具异常的修正提示
+│   └── hooks.py          # 模型调用日志、执行前审批与未知工具异常修正
 ├── ui/
 │   ├── __init__.py       # UI 包标识
 │   ├── commands.py       # 会话状态、斜杠命令和消息展示
@@ -119,6 +151,7 @@ coding-agent-cli/
 ├── .env.example          # 空密钥配置模板
 ├── .gitignore            # 排除本地密钥、会话记录、虚拟环境和缓存
 ├── test_session_store.py # 保存、恢复、写入异常与继续对话的离线测试
+├── test_permissions.py   # 审批拦截、授权范围、并发输入与快捷键离线测试
 ├── requirements.txt      # Python 依赖
 └── 项目阅读路线.md         # 分阶段阅读顺序与调用链路
 ```
@@ -130,7 +163,10 @@ flowchart LR
     A[用户输入] --> B{本地命令？}
     B -->|是| C[执行命令]
     B -->|否| D[Agent 调用模型]
-    D -->|需要工具| E[执行 Python 工具]
+    D -->|需要工具| P{权限检查}
+    P -->|自动允许或人工确认| E[执行 Python 工具]
+    P -->|拒绝| R[返回权限拒绝结果]
+    R --> D
     E --> D
     D -->|完成| F[保存会话并显示结果]
 ```
@@ -142,6 +178,8 @@ flowchart LR
 推荐顺序：`main.py` → 会话状态与命令注册 → `agent/core.py` → `agent/tools.py` → 结果处理 → `agent/hooks.py` → UI 展示。
 
 学习持久化时，沿着 `apply_result()` → `save_session()` → `cmd_resume()` → `load_session()` → `run_agent(message_history=...)` 阅读。
+
+学习权限审批时，沿着 `SessionState.permissions` → `run_agent(deps=...)` → `_approve_tool()` → `check_permission()` → `ask_permission()` 阅读。
 
 详细步骤、学习目标和动手练习见 [项目阅读路线](项目阅读路线.md)。
 
@@ -163,12 +201,14 @@ flowchart LR
 ### 离线验证
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store
+.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions
 ```
 
 测试使用模拟模型和 HTTP 传输，不访问真实 DeepSeek，不使用真实 API Key。覆盖逐步展示、限流恢复、鉴权失败、工具故障及重试耗尽、会话保留和中断等场景。
 
 持久化测试使用临时目录，覆盖完整消息往返、只追加新增消息、取消恢复、切换前保存失败、坏文件与不完整末行，以及恢复后旧历史进入下一次模型请求。
+
+权限测试覆盖三种模式、拒绝时不发生写入或启动进程、授权只匹配相同参数、并发审批不重叠、缺少权限上下文时拒绝执行，以及模拟终端中的真实 Shift+Tab 按键。
 
 ## 当前实现的边界
 

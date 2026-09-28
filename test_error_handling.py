@@ -34,6 +34,7 @@ from agent.hooks import ApiCall, api_call_log, hooks
 from agent.tools import read_file, run_command, write_file
 from ui import commands
 from ui.commands import SessionState
+from permissions import PermissionState
 
 
 class ToolErrorTests(unittest.TestCase):
@@ -83,7 +84,7 @@ class AgentErrorTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(models, "ALLOW_MODEL_REQUESTS", False):
             with patch.object(main, "agent", test_agent), patch.object(main, "console", Mock()):
                 with patch.object(main, "print_part", side_effect=displayed.append):
-                    result = await main.run_agent("测试", SessionState())
+                    result = await main.run_agent("测试", SessionState(permissions=PermissionState(mode="bypass")))
         self.assertEqual(result.output, "工具失败，停止操作")
         self.assertIn("retry-prompt", [p.part_kind for p in displayed])
 
@@ -103,7 +104,7 @@ class AgentErrorTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(main, "agent", test_agent), patch.object(main, "console", Mock()):
                 with patch.object(main, "print_part"):
                     with self.assertRaises(UnexpectedModelBehavior):
-                        await main.run_agent("测试", SessionState())
+                        await main.run_agent("测试", SessionState(permissions=PermissionState(mode="bypass")))
         self.assertEqual(len(executions), 3)
 
     async def test_main_continues_after_failure_and_keeps_previous_history(self):

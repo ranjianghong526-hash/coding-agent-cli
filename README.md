@@ -8,7 +8,8 @@
 
 - 多轮对话：将历史消息传入下一轮任务。
 - 会话持久化：每轮成功后追加保存，重启后用 `/resume` 恢复聊天上下文。
-- 文件工具：读取 UTF-8 文件、写入完整文件内容。
+- 文件工具：带行号分页读取 UTF-8 文件、完整写入或唯一文本局部替换。
+- 文件保护：先读后改、版本核对、重复读取去重与同一轮编辑排队执行。
 - 命令工具：执行 shell 命令，返回输出和失败信息。
 - 逐步展示：模型返回时显示文本与工具调用，每个工具返回时立即显示结果。
 - 会话统计：查看累计 token 用量，以及最近一轮模型 API 调用详情。
@@ -92,7 +93,7 @@ API_KEY=你的DeepSeek密钥
 
 启动时使用 `default` 模式。在主输入区按 **Shift+Tab**，按 `default → acceptEdits → auto → bypass → default` 顺序切换，底部提示栏显示当前模式，`/status` 也可查看。按两次即可从默认模式进入 `auto`。
 
-| 模式 | `read_file` | `write_file` | `run_command` |
+| 模式 | `read_file` | `write_file` / `edit_file` | `run_command` |
 |---|---|---|---|
 | `default` | 自动允许 | 执行前确认 | 执行前确认 |
 | `acceptEdits` | 自动允许 | 自动允许 | 执行前确认 |
@@ -136,6 +137,35 @@ auto 审查：运行测试符合用户明确提出的要求
 
 这是额外的模型请求，会增加等待和服务端用量；当前 `/status` 的 token 统计与 `/api-detail` 只覆盖主 Agent，不包含分类器请求。筛选转写、严格校验和失败回退能减少误放行风险，模型审查仍可能判断错误，不提供操作系统隔离。
 
+### 可靠文件编辑
+
+文件工具通过 SDK 注入的 `RunContext` 获取会话级 `FileContext`，模型只提供下面这些参数，不提供 `ctx`：
+
+| 工具 | 参数及行为 |
+|---|---|
+| `read_file` | `path`，可选 `offset=1`、`limit=200`、`force=False`；展示带行号的指定行区间 |
+| `write_file` | `path`、`content`；创建新文件或整体重写，父目录必须存在 |
+| `edit_file` | `path`、`old_string`、`new_string`；精确替换唯一一处原文，可用空的新文本删除片段 |
+
+修改已有文件必须先成功读取。整体覆盖还要求本会话已读取全部行；局部编辑只要求匹配位置已经读过。多个分页读取会合并已读范围。重复读取相同版本和范围只返回“文件未变化”，需要再看正文时设置 `force=True`；行号是展示信息，不属于要复制匹配的原文。
+
+```text
+read_file(path="config.py")
+  → 展示：1 | timeout = 10
+edit_file(path="config.py", old_string="timeout = 10", new_string="timeout = 30")
+  → 只修改这一处，其他内容保持
+```
+
+每次读取记录规范化路径、纳秒修改时间、文件大小、文件身份、SHA-256 摘要和已读行区间。写入时重新读取磁盘，核对版本：用户在编辑器修改、替换或删除文件后，旧快照不能继续覆盖。即使保留原 mtime，内容摘要也能发现变化。找不到原文或原文匹配多处（包括重叠匹配），均返回错误且不写入，不进行模糊替换。
+
+已有文件先写同目录临时文件、同步数据、再次核对版本，再原子替换；失败时清理临时文件。局部编辑保留未修改字节，以及纯 CRLF 文件的换行和 UTF-8 BOM。新建文件采用硬链接排他发布，用户恰好创建同名文件时不会覆盖；不支持硬链接的文件系统会明确返回错误，不降级为覆盖写入。
+
+四个工具都注册为 `Tool(..., sequential=True)`，SDK 按模型给出的顺序执行，文件工具另用会话内线程锁保护读取、检查和写入。成功写入后刷新状态，后续编辑依据新版本；局部读取后的编辑不会被登记成完整读取。`/new`、`/resume` 会清空文件快照，恢复聊天历史后仍须重新读磁盘。
+
+权限审批与文件保护是两道检查：先按模式确认“能否执行”，再由工具检查“是否读过、版本是否一致、匹配是否唯一”。即使 `bypass` 或 `acceptEdits` 放行，文件保护也不会跳过。`edit_file` 在 `default` 中需确认、在 `acceptEdits` 中自动允许、在 `auto` 中进入分类器。
+
+版本核对不是跨进程事务：外部程序仍可能在最后一次检查与替换之间修改文件；`run_command` 中的任意 shell 写入也不受文件工具内部保护。当前按单个 CLI 会话使用，不承诺多个进程协调编辑。
+
 ### 保存与恢复聊天
 
 每个会话对应项目根目录 `.sessions/<会话编号>.jsonl`。每轮成功完成后追加一行，包含本轮新增的完整消息、保存时间、模型名和累计 token 用量。消息包含用户输入、模型响应、工具调用及工具结果；不是只有终端展示的文字摘要。`.sessions/` 已加入 Git 忽略。
@@ -159,10 +189,11 @@ coding-agent-cli/
 ├── session_store.py      # JSONL 追加保存、扫描与完整消息恢复
 ├── permissions.py        # 四种权限模式、审批输入和本次运行的临时授权
 ├── classifier.py         # 对话转写、独立模型审查与严格裁决校验
+├── file_state.py         # 文件版本、已读行区间与会话内线程锁
 ├── agent/
 │   ├── __init__.py       # Agent 包的公开接口
 │   ├── core.py           # 加载配置，组装模型、工具和 hooks
-│   ├── tools.py          # 读文件、写文件、执行命令
+│   ├── tools.py          # 分页读取、完整写入、局部编辑和执行命令
 │   └── hooks.py          # 模型调用日志、执行前审批与未知工具异常修正
 ├── ui/
 │   ├── __init__.py       # UI 包标识
@@ -173,6 +204,7 @@ coding-agent-cli/
 ├── test_session_store.py # 保存、恢复、写入异常与继续对话的离线测试
 ├── test_permissions.py   # 审批拦截、授权范围、并发输入与快捷键离线测试
 ├── test_auto_mode.py     # 自动允许、人工回退、审查协议与转写离线测试
+├── test_file_edit.py     # 先读后改、版本冲突、唯一匹配和排队编辑测试
 ├── requirements.txt      # Python 依赖
 └── 项目阅读路线.md         # 分阶段阅读顺序与调用链路
 ```
@@ -204,6 +236,8 @@ flowchart LR
 
 学习自动审批时，沿着 `_approve_tool(ctx.messages)` → `check_permission(mode="auto")` → `classify()` → `build_transcript()` → `Verdict` → 自动返回或 `ask_permission()` 阅读。
 
+学习文件编辑时，沿着 `FileContext` → `read_file()` 登记 → `edit_file()` / `write_file()` 内部校验 → `_atomic_write()` → 更新读取状态阅读。
+
 详细步骤、学习目标和动手练习见 [项目阅读路线](项目阅读路线.md)。
 
 ## 错误处理与重试
@@ -224,7 +258,7 @@ flowchart LR
 ### 离线验证
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode
+.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit
 ```
 
 测试使用模拟模型和 HTTP 传输，不访问真实 DeepSeek，不使用真实 API Key。覆盖逐步展示、限流恢复、鉴权失败、工具故障及重试耗尽、会话保留和中断等场景。
@@ -235,12 +269,14 @@ flowchart LR
 
 auto 测试模拟独立 API，覆盖转写过滤与 JSON 转义、完整命令保留、严格布尔裁决、截断响应及超时、材料过大回退、本轮用户输入进入审查、自动允许后实际写入，以及人工拒绝时不写入。
 
+文件编辑测试使用临时文件，覆盖分页去重、部分与完整读取、文件变动及删除、保持 mtime 的内容变动、唯一匹配、CRLF/BOM 保留、原子替换失败、新建时同名竞争、会话切换清空快照、多个编辑排队和 auto 审批。
+
 ## 当前实现的边界
 
 - 成功轮次自动保存到本地，重启后通过 `/resume` 恢复；失败或中断轮次不保存到对话历史。
 - 存储与 CLI 按串行使用设计，不支持多个进程同时写同一个会话文件。
 - 当前按模型响应和工具完成的时机逐步输出，没有逐 token 的文字流式输出。
-- `write_file()` 会覆盖指定文件，不自动创建父目录。
+- 文件工具当前支持 UTF-8，父目录须存在；整体覆盖已有文件必须完整读取且版本一致。
 - shell 命令等待超时为 10 秒，工具操作会对本地文件和进程产生实际影响。
 - 调用日志按串行执行设计，不能直接用于同时执行多个任务。
 - 依赖尚未固定版本；真实 DeepSeek 调用需要配置有效密钥，并确认账号支持当前模型名。

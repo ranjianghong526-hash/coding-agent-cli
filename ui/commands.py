@@ -205,6 +205,7 @@ def cmd_new(state: SessionState) -> bool:
     state.last_api_calls.clear()
     state.session_id = uuid4().hex
     state.saved_messages = 0
+    state.permissions.files.clear()
     console.print("已开启新会话\n")
     return True
 
@@ -256,6 +257,7 @@ async def cmd_resume(state: SessionState) -> bool:
     state.output_tokens = selected.output_tokens
     state.last_api_calls.clear()
     # 模型继续使用当前 core.py 配置；不因历史文件而偷偷切换模型。
+    state.permissions.files.clear()
     console.print(f"已恢复会话 {selected.session_id}，共 {len(selected.history)} 条消息。\n")
     return True
 

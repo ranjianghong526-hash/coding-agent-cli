@@ -61,6 +61,7 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
         }
         for mode, decisions in expected.items():
             self.assertEqual([permissions.requires_approval(mode, name) for name in ("read_file", "write_file", "run_command", "new_tool")], decisions)
+            self.assertEqual(permissions.requires_approval(mode, "edit_file"), permissions.requires_approval(mode, "write_file"))
         with self.assertRaises(ValueError):
             permissions.requires_approval("unknown", "read_file")
 
@@ -95,9 +96,10 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "example.txt"
             path.write_text("你好", encoding="utf-8")
-            _, _, read_ask = await self.run_tool(read_file, {"path": str(path)})
+            state = SessionState()
+            _, _, read_ask = await self.run_tool(read_file, {"path": str(path)}, state)
             read_ask.assert_not_awaited()
-            state = SessionState(permissions=permissions.PermissionState(mode="acceptEdits"))
+            state.permissions.mode = "acceptEdits"
             _, _, write_ask = await self.run_tool(write_file, {"path": str(path), "content": "修改"}, state)
             write_ask.assert_not_awaited()
             self.assertEqual(path.read_text(encoding="utf-8"), "修改")

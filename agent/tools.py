@@ -1,43 +1,177 @@
 """
-Coding Agent 用到的三个工具：读文件、写文件、跑 shell 命令。
+Coding Agent 的文件读取、完整写入、局部编辑和 shell 命令工具。
 
 模型决定工具名和参数，Pydantic AI 调用下面的 Python 函数，返回值再交回模型。
 这些函数本身不调用大模型，也不负责保存对话历史。
 """
+import codecs
+import hashlib
+import os
+import stat
 import subprocess
+import tempfile
+from pathlib import Path
+
+from pydantic_ai import RunContext, Tool
+
+from file_state import FileVersion, ReadFileState
+from permissions import PermissionState
 
 
-def read_file(path: str) -> str:
-    """
-    读取指定文件的内容。
-    """
+def _path(path: str) -> tuple[Path, str]:
+    """相对路径、绝对路径和符号链接使用统一身份，避免绕过已读状态。"""
+    resolved = Path(path).expanduser().resolve()
+    return resolved, os.path.normcase(str(resolved))
+
+
+def _read_disk(path: Path) -> tuple[bytes, FileVersion]:
+    """读取真实磁盘字节，并检测读取期间的变动或文件被替换。"""
+    with open(path, "rb") as file:
+        before = os.fstat(file.fileno())
+        data = file.read()
+        after = os.fstat(file.fileno())
+    current = path.stat()
+    identity = lambda info: (info.st_mtime_ns, info.st_size, info.st_ino)
+    if identity(before) != identity(after) or identity(after) != identity(current) or len(data) != after.st_size:
+        raise OSError("文件在读取过程中发生变化，请重新读取")
+    return data, FileVersion(after.st_mtime_ns, after.st_size, after.st_ino, hashlib.sha256(data).hexdigest())
+
+
+def _require_read(ctx: RunContext[PermissionState], key: str, version: FileVersion, *, full: bool) -> None:
+    """即使权限允许也必须校验文件状态；这道保护属于真实工具内部。"""
+    record = ctx.deps.files.read_file_state.get(key)
+    if record is None:
+        raise ValueError("请先用 read_file 读取该文件，再修改")
+    if record.version != version:
+        raise ValueError("文件自上次读取后已变化，未写入；请重新 read_file 后调整修改")
+    if full and not record.fully_read:
+        raise ValueError("整体覆盖前必须完整读取文件；请读取剩余行，或改用 edit_file 局部编辑")
+
+
+def _atomic_write(path: Path, data: bytes, expected: FileVersion | None) -> FileVersion:
+    """先写同目录临时文件；已有文件再核对版本后原子替换，新建使用排他创建。"""
+    temporary = None
     try:
-        # with 在读取成功或发生异常后都会关闭文件，避免文件句柄泄漏。
-        # 相对路径按进程工作目录解析，而不是按本 tools.py 所在目录解析。
-        with open(path, "r", encoding="utf-8") as f:
-            # 一次性返回整个文件，没有按大小截断或按行分页。
-            return f.read()
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as file:
+            temporary = Path(file.name)
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        if expected is None:
+            # 硬链接创建不会覆盖已存在路径，防止检查后用户恰好创建同名文件。
+            # 临时文件和目标在同目录；不支持硬链接的文件系统明确报错，不降级覆盖。
+            os.link(temporary, path)
+        else:
+            os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
+            _, current = _read_disk(path)
+            if current != expected:
+                raise ValueError("文件在写入前发生变化，未覆盖；请重新读取")
+            os.replace(temporary, path)
+        _, version = _read_disk(path)
+        if version.digest != hashlib.sha256(data).hexdigest():
+            raise OSError("写入后文件又发生变化，请重新读取确认")
+        return version
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def read_file(ctx: RunContext[PermissionState], path: str, offset: int = 1, limit: int = 200, force: bool = False) -> str:
+    """读取 UTF-8 文件并显示行号；offset 从 1 开始，limit 为行数。重复读取可用 force 强制显示。"""
+    if offset < 1 or limit < 1:
+        return "[错误] offset 和 limit 必须大于等于 1"
+    key = None
+    try:
+        resolved, key = _path(path)
+        with ctx.deps.files.lock:
+            data, version = _read_disk(resolved)
+            lines = data.decode("utf-8-sig").splitlines()
+            if offset > max(1, len(lines)):
+                return f"[错误] 起始行超出文件范围，文件共 {len(lines)} 行"
+            record = ctx.deps.files.read_file_state.get(key)
+            if record is None or record.version != version:
+                record = ReadFileState(version, len(lines))
+            end = min(len(lines), offset + limit - 1)
+            if not force and record.contains(offset, end):
+                region = f"第 {offset}～{end} 行" if lines else "空文件"
+                return f"文件未变化，{region}此前已读取；如需再次显示请设置 force=True"
+            record.record(offset, end)
+            ctx.deps.files.read_file_state[key] = record
+            if not lines:
+                return "(空文件)"
+            text = "\n".join(f"{number:>4} | {lines[number - 1]}" for number in range(offset, end + 1))
+            more = f"\n还有后续行，请从 offset={end + 1} 继续读取。" if end < len(lines) else ""
+            return f"{resolved}（共 {len(lines)} 行，显示 {offset}～{end}）\n{text}{more}"
     except FileNotFoundError:
-        # 已知环境错误转换成工具结果，模型据此调整路径或操作。
-        return f"错误：文件 {path} 不存在"
-    except (OSError, UnicodeError) as error:
-        # 例如权限不足、路径是目录、文件不是 UTF-8；错误不能伪装成读取成功。
+        if key is not None:
+            # 模型已通过真实读取获知文件不存在，清除过期的已读记录。
+            with ctx.deps.files.lock:
+                ctx.deps.files.read_file_state.pop(key, None)
+        return f"[错误] 文件 {path} 不存在"
+    except (OSError, UnicodeError, ValueError) as error:
         return f"[错误] 无法读取 {path}：{error}"
 
 
-def write_file(path: str, content: str) -> str:
-    """
-    将内容写入指定文件。
-    """
-    # w 模式会覆盖已有文件，也会创建新文件；不会自动创建父目录。
-    # 因此模型应先读已有内容，再决定需要写回的完整文本。
+def write_file(ctx: RunContext[PermissionState], path: str, content: str) -> str:
+    """创建 UTF-8 文件或完整重写；覆盖已有文件前必须完整读取且版本未变。父目录必须存在。"""
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-    except (OSError, UnicodeError) as error:
-        # 父目录不存在、没有写入权限等问题直接反馈，不自动更换路径或重复写入。
+        resolved, key = _path(path)
+        with ctx.deps.files.lock:
+            expected = None
+            bom = b""
+            if resolved.exists():
+                old, expected = _read_disk(resolved)
+                _require_read(ctx, key, expected, full=True)
+                bom = codecs.BOM_UTF8 if old.startswith(codecs.BOM_UTF8) and not content.startswith("\ufeff") else b""
+            elif key in ctx.deps.files.read_file_state:
+                raise ValueError("文件在上次读取后被删除，未重新创建；请先 read_file 确认当前状态")
+            data = bom + content.encode("utf-8")
+            version = _atomic_write(resolved, data, expected)
+            count = len(content.splitlines())
+            record = ReadFileState(version, count)
+            record.record(1, count)
+            ctx.deps.files.read_file_state[key] = record
+            return f"已写入 {path}"
+    except (OSError, UnicodeError, ValueError) as error:
         return f"[错误] 无法写入 {path}：{error}"
-    return f"已写入 {path}"
+
+
+def edit_file(ctx: RunContext[PermissionState], path: str, old_string: str, new_string: str) -> str:
+    """精确替换一处文本；先读取文件，old_string 必须非空且在整个文件中唯一。"""
+    if not old_string:
+        return "[错误] old_string 不能为空；创建文件请使用 write_file"
+    if old_string == new_string:
+        return "[错误] 新旧文本相同，无需编辑"
+    try:
+        resolved, key = _path(path)
+        with ctx.deps.files.lock:
+            data, version = _read_disk(resolved)
+            _require_read(ctx, key, version, full=False)
+            text = data.decode("utf-8-sig")
+            # Windows 换行文件也可以匹配模型提供的 LF 文本；写回保留原换行字节。
+            newline = "\r\n" if "\r\n" in text and "\n" not in text.replace("\r\n", "") else "\n"
+            old = old_string.replace("\r\n", "\n").replace("\n", newline)
+            new = new_string.replace("\r\n", "\n").replace("\n", newline)
+            first = text.find(old)
+            if first < 0:
+                return "[错误] 未找到 old_string，文件未修改；请重新读取并复制精确文本"
+            if text.find(old, first + 1) >= 0:
+                return "[错误] old_string 匹配多处，文件未修改；请增加上下文使其唯一"
+            start_line = text.count("\n", 0, first) + 1
+            end_line = text.count("\n", 0, first + len(old) - 1) + 1
+            if not ctx.deps.files.read_file_state[key].contains(start_line, end_line):
+                return "[错误] 匹配位置尚未读取，文件未修改；请 read_file 读取目标行后再编辑"
+            updated = text[:first] + new + text[first + len(old):]
+            bom = codecs.BOM_UTF8 if data.startswith(codecs.BOM_UTF8) else b""
+            changed = _atomic_write(resolved, bom + updated.encode("utf-8"), version)
+            # 模型只看到了局部内容时，编辑后也不能冒充完整读取。
+            record = ReadFileState(changed, len(updated.splitlines()))
+            if ctx.deps.files.read_file_state[key].fully_read:
+                record.record(1, record.total_lines)
+            ctx.deps.files.read_file_state[key] = record
+            return f"已编辑 {path}：完成 1 处替换"
+    except (OSError, UnicodeError, ValueError) as error:
+        return f"[错误] 无法编辑 {path}：{error}"
 
 
 def run_command(command: str) -> str:
@@ -65,7 +199,14 @@ def run_command(command: str) -> str:
         return f"[错误] 无法启动命令：{error}"
 
 
-# Pydantic AI 支持 tools=[plain_function]，从函数签名 + docstring 自动生成 JSON Schema
+# RunContext 参数由 SDK 注入，不出现在模型的工具参数中；sequential 让编辑调用按模型顺序排队。
+# SDK 从函数签名 + docstring 自动生成 JSON Schema
 # JSON Schema 是工具参数的结构说明：模型据此知道有哪些参数及其类型。
 # 工具 docstring 也会参与模型看到的说明，因此教学细节主要放在 # 注释里。
-TOOLS = [read_file, write_file, run_command]
+TOOLS = [
+    Tool(read_file, sequential=True),
+    Tool(write_file, sequential=True),
+    Tool(edit_file, sequential=True),
+    # 命令也可能改文件，设置为排队工具，避免与本 Agent 的文件读写同时执行。
+    Tool(run_command, sequential=True),
+]

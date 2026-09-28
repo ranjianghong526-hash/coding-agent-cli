@@ -10,6 +10,7 @@ from pydantic_ai.exceptions import SkipToolExecution
 from pydantic_ai.messages import ModelMessage
 
 from classifier import classify
+from file_state import FileContext
 
 from ui.render import console
 
@@ -25,6 +26,8 @@ class PermissionState:
     allowed_calls: set[tuple[str, str]] = field(default_factory=set)
     # 模型可能一次返回多个工具调用，锁保证终端只有一个审批问题。
     approval_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # 现有 deps 是主循环共享的运行上下文，文件记录单独放在 FileContext 中。
+    files: FileContext = field(default_factory=FileContext)
 
     def cycle_mode(self) -> None:
         """Shift+Tab 按固定顺序切换模式，不影响正在编辑的需求。"""
@@ -37,7 +40,7 @@ def requires_approval(mode: PermissionMode, tool_name: str) -> bool:
         raise ValueError("未知权限模式")
     if mode == "bypass" or tool_name == "read_file":
         return False
-    return not (mode == "acceptEdits" and tool_name == "write_file")
+    return not (mode == "acceptEdits" and tool_name in ("write_file", "edit_file"))
 
 
 async def ask_permission(tool_name: str, args: dict[str, Any]) -> tuple[bool, bool, str]:

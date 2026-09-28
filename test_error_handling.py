@@ -38,23 +38,30 @@ from permissions import PermissionState
 
 
 class ToolErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.ctx = SimpleNamespace(deps=PermissionState())
+
     def test_known_file_errors_return_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            self.assertIn("不存在", read_file(str(root / "missing.txt")))
-            self.assertIn("[错误]", read_file(str(root)))
+            self.assertIn("不存在", read_file(self.ctx, str(root / "missing.txt")))
+            self.assertIn("[错误]", read_file(self.ctx, str(root)))
             invalid = root / "invalid.txt"
             invalid.write_bytes(b"\xff")
-            self.assertIn("[错误]", read_file(str(invalid)))
-            self.assertIn("[错误]", write_file(str(root / "missing" / "file.txt"), "hello"))
+            self.assertIn("[错误]", read_file(self.ctx, str(invalid)))
+            self.assertIn("[错误]", write_file(self.ctx, str(root / "missing" / "file.txt"), "hello"))
             good = root / "good.txt"
-            self.assertIn("已写入", write_file(str(good), "你好"))
-            self.assertEqual(read_file(str(good)), "你好")
+            self.assertIn("已写入", write_file(self.ctx, str(good), "你好"))
+            self.assertIn("你好", read_file(self.ctx, str(good), force=True))
 
     def test_permissions_and_command_errors_are_not_success(self):
-        with patch("builtins.open", side_effect=PermissionError("denied")):
-            self.assertIn("[错误]", read_file("example.txt"))
-            self.assertIn("[错误]", write_file("example.txt", "hello"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "example.txt"
+            path.write_text("original", encoding="utf-8")
+            with patch("builtins.open", side_effect=PermissionError("denied")):
+                self.assertIn("[错误]", read_file(self.ctx, str(path)))
+                self.assertIn("[错误]", write_file(self.ctx, str(path), "hello"))
+            self.assertEqual(path.read_text(encoding="utf-8"), "original")
         for error in [OSError("cannot start"), subprocess.TimeoutExpired("demo", 10)]:
             with self.subTest(error=type(error).__name__):
                 with patch("agent.tools.subprocess.run", side_effect=error):

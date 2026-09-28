@@ -52,10 +52,11 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
                     result = await main.run_agent("测试工具审批", state or SessionState())
         return result, requests, ask
 
-    def test_three_modes_and_unknown_tools(self):
+    def test_permission_modes_and_unknown_tools(self):
         expected = {
             "default": [False, True, True, True],
             "acceptEdits": [False, False, True, True],
+            "auto": [False, True, True, True],
             "bypass": [False, False, False, False],
         }
         for mode, decisions in expected.items():
@@ -171,6 +172,8 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(main, "prompt_session", session), patch.object(main, "print_divider"):
                     self.assertEqual(await main.read_user_input(state), "hello world")
         self.assertEqual(state.permissions.mode, "acceptEdits")
+        state.permissions.cycle_mode()
+        self.assertEqual(state.permissions.mode, "auto")
         state.permissions.cycle_mode()
         self.assertEqual(state.permissions.mode, "bypass")
         state.permissions.cycle_mode()

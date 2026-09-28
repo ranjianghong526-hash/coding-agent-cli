@@ -1,16 +1,20 @@
 """工具执行前的人工审批：权限规则和临时授权只在本次程序运行中生效。"""
 import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from prompt_toolkit import PromptSession
 from pydantic_ai.exceptions import SkipToolExecution
+from pydantic_ai.messages import ModelMessage
+
+from classifier import classify
 
 from ui.render import console
 
-PermissionMode = Literal["default", "acceptEdits", "bypass"]
-MODES: tuple[PermissionMode, ...] = ("default", "acceptEdits", "bypass")
+PermissionMode = Literal["default", "acceptEdits", "auto", "bypass"]
+MODES: tuple[PermissionMode, ...] = ("default", "acceptEdits", "auto", "bypass")
 
 
 @dataclass
@@ -23,7 +27,7 @@ class PermissionState:
     approval_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def cycle_mode(self) -> None:
-        """Shift+Tab 按固定顺序切换三个模式，不影响正在编辑的需求。"""
+        """Shift+Tab 按固定顺序切换模式，不影响正在编辑的需求。"""
         self.mode = MODES[(MODES.index(self.mode) + 1) % len(MODES)]
 
 
@@ -57,7 +61,10 @@ async def ask_permission(tool_name: str, args: dict[str, Any]) -> tuple[bool, bo
         console.print("请输入 y、a 或 n，也可以在 n 后填写拒绝说明。")
 
 
-async def check_permission(state: PermissionState, tool_name: str, args: dict[str, Any]) -> None:
+async def check_permission(
+    state: PermissionState, tool_name: str, args: dict[str, Any],
+    messages: Sequence[ModelMessage] = (),
+) -> None:
     """允许则返回；拒绝则跳过真实工具，并把明确的拒绝结果交给模型。"""
     async with state.approval_lock:
         if not requires_approval(state.mode, tool_name):
@@ -66,6 +73,14 @@ async def check_permission(state: PermissionState, tool_name: str, args: dict[st
         # 在锁内再检查授权，前一个并发审批刚记住的许可可以被后一个使用。
         if key in state.allowed_calls:
             return
+        if state.mode == "auto":
+            console.print(f"✻ auto 正在审查 {tool_name}…", style="dim", markup=False)
+            verdict = await classify(messages, tool_name, args)
+            console.print(f"auto 审查：{verdict['reason']}", markup=False)
+            if verdict["should_block"] is False:
+                # 自动裁决只对当前调用有效；不记入 allowed_calls，下一次重新看上下文。
+                return
+            # 拦截表示停止自动允许，仍由已有人工审批给出最终决定。
         allowed, remember, reason = await ask_permission(tool_name, args)
         if not allowed:
             console.print(f"已拒绝 {tool_name}，工具未执行。", style="yellow", markup=False)

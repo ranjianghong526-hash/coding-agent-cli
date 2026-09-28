@@ -14,7 +14,8 @@
 - 会话统计：查看累计 token 用量，以及最近一轮模型 API 调用详情。
 - 本地配置：从项目根目录的 `.env` 加载 API Key。
 - 错误恢复：API 请求自动重试，工具错误反馈给模型，本轮失败后 CLI 仍可继续输入。
-- 权限审批：执行前确认工具及完整参数，支持三种模式、临时授权与拒绝说明。
+- 权限审批：执行前检查工具及完整参数，支持四种模式、临时授权与拒绝说明。
+- 自动审批：`auto` 模式由独立模型请求审查操作，无法自动放行时回退人工确认。
 
 ## 快速开始
 
@@ -89,15 +90,16 @@ API_KEY=你的DeepSeek密钥
 
 ### 工具权限审批
 
-启动时使用 `default` 模式。在主输入区按 **Shift+Tab**，按 `default → acceptEdits → bypass → default` 顺序切换，底部提示栏显示当前模式，`/status` 也可查看。
+启动时使用 `default` 模式。在主输入区按 **Shift+Tab**，按 `default → acceptEdits → auto → bypass → default` 顺序切换，底部提示栏显示当前模式，`/status` 也可查看。按两次即可从默认模式进入 `auto`。
 
 | 模式 | `read_file` | `write_file` | `run_command` |
 |---|---|---|---|
 | `default` | 自动允许 | 执行前确认 | 执行前确认 |
 | `acceptEdits` | 自动允许 | 自动允许 | 执行前确认 |
+| `auto` | 自动允许 | 分类器审查，不放行则人工确认 | 分类器审查，不放行则人工确认 |
 | `bypass` | 自动允许 | 自动允许 | 自动允许 |
 
-新工具默认需要审批，只有明确的只读白名单与文件写入规则自动放行。审批界面完整显示工具参数，例如：
+新工具默认需要审批，在 `auto` 下先交给分类器；只有明确的只读白名单与模式规则直接放行。审批界面完整显示工具参数，例如：
 
 ```text
 工具执行需要确认：write_file
@@ -116,6 +118,23 @@ API_KEY=你的DeepSeek密钥
 拒绝由执行前 hook 使用 `SkipToolExecution` 拦截，真实工具不会执行，模型收到 `[权限拒绝]` 工具结果；这不会消耗 `ModelRetry` 的修正次数。多个并发调用的审批输入通过锁串行处理。审批区域不绑定模式切换快捷键。
 
 权限模式与临时授权属于本次程序运行：`/new`、`/resume` 保留当前权限设置，不把它们写入聊天记录；重启后重新回到 `default`。权限检查只拦截本 Agent 经 SDK 发起的工具调用，工具函数被其他 Python 代码直接调用时不经过此 hook。它不是操作系统沙箱，也不限制已经允许的 shell 命令内部会执行哪些操作。
+
+### auto 自动审批
+
+`auto` 继续使用同一个执行前 hook，只读操作和已有人工临时授权仍直接通过。其余工具调用先发送独立的分类器请求：
+
+```text
+✻ auto 正在审查 run_command…
+auto 审查：运行测试符合用户明确提出的要求
+```
+
+返回严格的 `{"should_block": false, "reason": "..."}` 时自动允许；返回 `true` 或审查失败时打印理由，再使用原有 `y / a / n` 人工审批。`should_block` 表示停止自动执行，不是直接替用户做最终拒绝。自动允许不记入临时授权，每次重新审查当前上下文；选择 `a` 的人工授权仍仅匹配相同工具和完整参数。
+
+分类器使用 `core.py` 当前模型与 API 配置，单独调用 Chat Completions，不经过主 Agent 的 hooks。超时 15 秒、不额外重试；网络故障、响应未正常完成、无效 JSON、非布尔裁决或空理由都回退人工，用户主动中断仍向外传播。
+
+审查材料只保留用户输入与工具调用，工具结果、模型正文和思考片段不发送。每行使用 JSON 编码，避免参数中的换行伪造独立的用户授权行；最后一行为本次待审查操作。完整参数不截断，转写超过 60,000 字符时直接回退人工，并附上项目目录、工作目录与临时目录供判断路径范围。
+
+这是额外的模型请求，会增加等待和服务端用量；当前 `/status` 的 token 统计与 `/api-detail` 只覆盖主 Agent，不包含分类器请求。筛选转写、严格校验和失败回退能减少误放行风险，模型审查仍可能判断错误，不提供操作系统隔离。
 
 ### 保存与恢复聊天
 
@@ -138,7 +157,8 @@ API_KEY=你的DeepSeek密钥
 coding-agent-cli/
 ├── main.py               # 入口、输入循环、命令分流和结果处理
 ├── session_store.py      # JSONL 追加保存、扫描与完整消息恢复
-├── permissions.py        # 三种权限模式、审批输入和本次运行的临时授权
+├── permissions.py        # 四种权限模式、审批输入和本次运行的临时授权
+├── classifier.py         # 对话转写、独立模型审查与严格裁决校验
 ├── agent/
 │   ├── __init__.py       # Agent 包的公开接口
 │   ├── core.py           # 加载配置，组装模型、工具和 hooks
@@ -152,6 +172,7 @@ coding-agent-cli/
 ├── .gitignore            # 排除本地密钥、会话记录、虚拟环境和缓存
 ├── test_session_store.py # 保存、恢复、写入异常与继续对话的离线测试
 ├── test_permissions.py   # 审批拦截、授权范围、并发输入与快捷键离线测试
+├── test_auto_mode.py     # 自动允许、人工回退、审查协议与转写离线测试
 ├── requirements.txt      # Python 依赖
 └── 项目阅读路线.md         # 分阶段阅读顺序与调用链路
 ```
@@ -181,6 +202,8 @@ flowchart LR
 
 学习权限审批时，沿着 `SessionState.permissions` → `run_agent(deps=...)` → `_approve_tool()` → `check_permission()` → `ask_permission()` 阅读。
 
+学习自动审批时，沿着 `_approve_tool(ctx.messages)` → `check_permission(mode="auto")` → `classify()` → `build_transcript()` → `Verdict` → 自动返回或 `ask_permission()` 阅读。
+
 详细步骤、学习目标和动手练习见 [项目阅读路线](项目阅读路线.md)。
 
 ## 错误处理与重试
@@ -201,14 +224,16 @@ flowchart LR
 ### 离线验证
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions
+.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode
 ```
 
 测试使用模拟模型和 HTTP 传输，不访问真实 DeepSeek，不使用真实 API Key。覆盖逐步展示、限流恢复、鉴权失败、工具故障及重试耗尽、会话保留和中断等场景。
 
 持久化测试使用临时目录，覆盖完整消息往返、只追加新增消息、取消恢复、切换前保存失败、坏文件与不完整末行，以及恢复后旧历史进入下一次模型请求。
 
-权限测试覆盖三种模式、拒绝时不发生写入或启动进程、授权只匹配相同参数、并发审批不重叠、缺少权限上下文时拒绝执行，以及模拟终端中的真实 Shift+Tab 按键。
+权限测试覆盖四种模式、拒绝时不发生写入或启动进程、授权只匹配相同参数、并发审批不重叠、缺少权限上下文时拒绝执行，以及模拟终端中的真实 Shift+Tab 按键。
+
+auto 测试模拟独立 API，覆盖转写过滤与 JSON 转义、完整命令保留、严格布尔裁决、截断响应及超时、材料过大回退、本轮用户输入进入审查、自动允许后实际写入，以及人工拒绝时不写入。
 
 ## 当前实现的边界
 

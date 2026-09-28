@@ -55,7 +55,8 @@ async def _approve_tool(ctx, *, call, tool_def, args):
     if not isinstance(ctx.deps, PermissionState):
         # 调用方必须明确传入权限状态；漏传时不能绕过审批直接执行工具。
         raise SkipToolExecution("[权限拒绝] 缺少权限上下文，工具未执行。")
-    await check_permission(ctx.deps, call.tool_name, args)
+    # ctx.messages 包括本轮真实用户输入和模型刚提出的工具调用，不能只传上轮历史。
+    await check_permission(ctx.deps, call.tool_name, args, ctx.messages)
     return args
 
 

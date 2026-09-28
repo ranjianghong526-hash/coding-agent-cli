@@ -19,6 +19,7 @@ from pydantic_ai.providers.deepseek import DeepSeekProvider
 from .hooks import hooks
 from .tools import TOOLS
 from permissions import PermissionState
+from classifier import configure_classifier
 
 # 固定读取项目根目录的 .env，保留已设置的系统环境变量。
 # __file__ 是当前文件路径；两次 parent 从 agent/core.py 回到项目根目录。
@@ -44,6 +45,9 @@ client = AsyncOpenAI(
     max_retries=2,
     timeout=30.0,
 )
+# 审查是独立请求，不经 Agent；复用密钥、地址和连接，使用更短超时且不额外重试。
+# 审查失败及时转人工，不重复执行工具，也不另建一套环境变量配置。
+configure_classifier(client.with_options(timeout=15.0, max_retries=0), MODEL_NAME)
 model = OpenAIChatModel(
     MODEL_NAME,
     provider=DeepSeekProvider(openai_client=client),

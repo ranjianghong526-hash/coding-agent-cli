@@ -4,13 +4,15 @@
 主循环在每轮 run_agent 之前清空 api_call_log，跑完后快照到 SessionState 里，
 /api-detail 命令再把这一轮的所有调用展示给用户。
 
-hook（钩子）是框架在指定时机自动调用的函数：这里在请求前后各记录一次。
+hook（钩子）是框架在指定时机自动调用的函数：请求前后记录日志，请求失败时补日志，
+工具未知异常时转换为 ModelRetry，让模型有机会修正操作。
 日志只记录模型调用的摘要，没有保存完整的 HTTP 请求体和响应体。
 """
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic_ai.capabilities import Hooks
+from pydantic_ai import ModelRetry
 
 
 # dataclass 根据字段自动生成初始化方法等，适合保存结构明确的一条调用记录。
@@ -89,3 +91,27 @@ async def _record_response(ctx, request_context, response):
         call.output_tokens = response.usage.output_tokens
     # 原样返回响应，日志收集不改变后续的工具调度和结果处理。
     return response
+
+
+@hooks.on.model_request_error
+async def _record_request_error(ctx, request_context, error):
+    """请求最终失败时补全日志，再原样抛出，交给 CLI 安全网处理。"""
+    if api_call_log:
+        # 不记录原始响应体，避免把接口错误中的敏感信息展示到 /api-detail。
+        status = getattr(error, "status_code", None)
+        api_call_log[-1].finish_reason = f"error: {status or type(error).__name__}"
+    raise error
+
+
+@hooks.on.tool_execute_error
+async def _recover_tool_error(ctx, *, call, tool_def, args, error):
+    """第二道工具防线：把未预料到的异常变成有次数限制的模型修正提示。"""
+    if isinstance(error, ModelRetry):
+        # 工具自己提供的修正信息保持不变，不覆盖成通用提示。
+        raise error
+    # 此处是框架明确提供的异常边界；不吞异常、不返回成功，也不输出原始异常内容。
+    # ModelRetry 会生成 retry-prompt 交给模型，由模型选择改参数、换工具或解释失败。
+    raise ModelRetry(
+        f"工具 {call.tool_name} 执行失败（{type(error).__name__}）。"
+        "请检查参数和调用方式，修正后再尝试；无法修复时向用户说明失败。"
+    ) from error

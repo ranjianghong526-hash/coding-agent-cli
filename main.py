@@ -7,6 +7,7 @@
 import asyncio
 
 from pydantic_ai import Agent, FunctionToolResultEvent
+from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 
 # prompt_toolkit 负责输入体验，模型判断与工具执行不由它处理。
 from prompt_toolkit import PromptSession
@@ -56,8 +57,11 @@ def handle_command(user_input, state):
         # 普通自然语言需求继续走 Agent 分支。
         return "pass"
     # 去掉开头的 /，只取第一个词作为命令名；当前命令不解析额外参数。
-    # 注意：单独输入 / 没有命令名，现有代码会触发 IndexError。
-    cmd_name = user_input[1:].split()[0]
+    words = user_input[1:].split()
+    if not words:
+        console.print("请输入命令名，例如 /help\n")
+        return "continue"
+    cmd_name = words[0]
     # 注册表把名字映射到 Command 对象，避免为每条命令写一个 if 分支。
     command = COMMANDS.get(cmd_name)
     if command is None:
@@ -110,6 +114,27 @@ async def run_agent(user_input: str, state: SessionState):
         return agent_run.result
 
 
+def print_run_error(error: Exception) -> None:
+    """把最终失败转换成用户能采取行动的提示，不打印完整响应体或密钥。"""
+    if isinstance(error, ModelHTTPError):
+        hints = {
+            400: "模型请求参数不正确，请检查模型名和接口配置。",
+            401: "API Key 无效，请检查 .env 中的 API_KEY。",
+            402: "账号余额不足，请检查模型服务账号。",
+            403: "接口访问被拒绝，请检查账号权限。",
+            404: "模型或接口不存在，请检查 MODEL_NAME 和服务地址。",
+            429: "请求被限流，自动重试仍失败，请稍后再试。",
+        }
+        message = hints.get(error.status_code, "模型服务请求失败，请稍后再试。")
+        message = f"HTTP {error.status_code}：{message}"
+    elif isinstance(error, UnexpectedModelBehavior):
+        message = "模型响应异常或工具修正次数已耗尽，请调整需求后再试。"
+    else:
+        message = f"本轮执行失败（{type(error).__name__}），请检查网络或运行环境后再试。"
+    console.print(message, style="red", markup=False)
+    console.print("可以继续输入；本轮未保存到对话历史，已执行的文件或命令操作不会自动撤销。\n")
+
+
 async def main():
     """维护一份会话状态，持续接收用户输入，直到命令或输入信号要求退出。"""
     # 状态只在内存中存活；程序退出后不会自动保存到磁盘。
@@ -125,19 +150,29 @@ async def main():
         if not user_input:
             continue
 
-        # /new、/status 等命令在本地完成，不触发模型请求。
-        action = handle_command(user_input, state)
-        if action == "break":
-            break
-        if action == "continue":
-            continue
+        try:
+            # 先清空临时日志，防止本地命令抛错时把上一轮用量再次累计。
+            api_call_log.clear()
+            # /new、/status 等命令在本地完成，不触发模型请求。
+            action = handle_command(user_input, state)
+            if action == "break":
+                break
+            if action == "continue":
+                continue
 
-        # 日志按“本轮需求”收集：清空旧日志，再让请求前后的 hooks 写入新日志。
-        api_call_log.clear()
-        # await 等待本轮完成，run_agent() 会在等待期间逐步展示执行结果。
-        # 外层仍按顺序处理用户输入，不同时运行多个任务。
-        result = await run_agent(user_input, state)
-        apply_result(state, result)
+            result = await run_agent(user_input, state)
+            apply_result(state, result)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # 用户主动中断不是工具故障，不自动重试，结束程序。
+            console.print("\n任务已中断，退出程序。")
+            break
+        except Exception as error:
+            # CLI 最外层安全网捕获未知错误；只中止本轮，不重新执行可能有副作用的工具。
+            # 历史仍保留上一轮成功状态，避免将未配对的工具调用传给下一轮模型。
+            state.last_api_calls = list(api_call_log)
+            state.input_tokens += sum(call.input_tokens for call in api_call_log)
+            state.output_tokens += sum(call.output_tokens for call in api_call_log)
+            print_run_error(error)
 
 
 # 直接执行 python main.py 时启动交互；被其他模块导入时不自动进入主循环。

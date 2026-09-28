@@ -2,3 +2,4 @@ pydantic-ai
 prompt-toolkit
 rich
 python-dotenv
+openai

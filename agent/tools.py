@@ -18,8 +18,11 @@ def read_file(path: str) -> str:
             # 一次性返回整个文件，没有按大小截断或按行分页。
             return f.read()
     except FileNotFoundError:
-        # 返回错误文本让模型看到原因；权限错误等其他异常没有在这里捕获。
+        # 已知环境错误转换成工具结果，模型据此调整路径或操作。
         return f"错误：文件 {path} 不存在"
+    except (OSError, UnicodeError) as error:
+        # 例如权限不足、路径是目录、文件不是 UTF-8；错误不能伪装成读取成功。
+        return f"[错误] 无法读取 {path}：{error}"
 
 
 def write_file(path: str, content: str) -> str:
@@ -28,8 +31,12 @@ def write_file(path: str, content: str) -> str:
     """
     # w 模式会覆盖已有文件，也会创建新文件；不会自动创建父目录。
     # 因此模型应先读已有内容，再决定需要写回的完整文本。
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+    except (OSError, UnicodeError) as error:
+        # 父目录不存在、没有写入权限等问题直接反馈，不自动更换路径或重复写入。
+        return f"[错误] 无法写入 {path}：{error}"
     return f"已写入 {path}"
 
 
@@ -54,6 +61,8 @@ def run_command(command: str) -> str:
         return output or "(无输出)"
     except subprocess.TimeoutExpired:
         return "[错误] 命令执行超时（10秒）"
+    except OSError as error:
+        return f"[错误] 无法启动命令：{error}"
 
 
 # Pydantic AI 支持 tools=[plain_function]，从函数签名 + docstring 自动生成 JSON Schema

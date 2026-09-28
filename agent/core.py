@@ -9,6 +9,7 @@ from pathlib import Path
 
 # python-dotenv 将 .env 文件里的键值加载进进程环境变量。
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 # Agent 是协调模型和工具的框架对象；模型适配器负责组织模型接口请求。
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -33,9 +34,18 @@ MODEL_NAME = "deepseek-flash"
 
 # OpenAIChatModel 是接口格式适配器，实际服务提供方由 DeepSeekProvider 指定。
 # 这里创建配置对象，不等于已经发送了用户需求。
+# API 层只重试当前 HTTP 请求，不能重跑整轮 Agent，否则已执行的工具可能重复操作。
+# 网络错误、超时、限流和服务端临时错误最多额外重试 2 次；普通鉴权错误不重试。
+# 设置单次请求超时，避免网络不可用时一直等待。
+client = AsyncOpenAI(
+    api_key=API_KEY,
+    base_url="https://api.deepseek.com",
+    max_retries=2,
+    timeout=30.0,
+)
 model = OpenAIChatModel(
     MODEL_NAME,
-    provider=DeepSeekProvider(api_key=API_KEY),
+    provider=DeepSeekProvider(openai_client=client),
 )
 
 # 同一个 Agent 实例可以执行多轮任务；对话历史由 main.py 显式传入。
@@ -50,6 +60,9 @@ agent = Agent(
     ),
     # 注册后，框架允许模型选择工具并把参数映射为 Python 函数调用。
     tools=TOOLS,
+    # 工具参数错误或 ModelRetry 让模型尝试修正，超过上限则交给主循环提示失败。
+    # 这与 client.max_retries 的网络重试是两种不同的机制。
+    retries=2,
     # hooks 在每次模型请求前后记账，不负责执行文件或命令操作。
     capabilities=[hooks],
 )

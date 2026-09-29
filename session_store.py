@@ -102,8 +102,18 @@ def save_session(state: "SessionState") -> None:
 
 def load_session(session_id: str) -> SavedSession:
     """恢复完整消息对象和累计统计，不调用模型，也不重新执行历史中的工具。"""
-    turns, _ = _read_turns(_session_path(session_id))
+    from task_store import TaskDocument, TaskStore
+
+    path = _session_path(session_id)
+    task_path = TaskStore.path(session_id)
+    tasks = TaskDocument.model_validate_json(task_path.read_bytes()) if task_path.exists() else None
+    turns, _ = _read_turns(path) if path.exists() else ([], 0)
     if not turns:
+        if tasks is not None:
+            # 第一轮模型失败时任务已经落盘，但聊天还没有完整轮次，仍允许恢复计划。
+            title = tasks.tasks[0].subject if tasks.tasks else "仅任务记录"
+            updated = datetime.fromtimestamp(task_path.stat().st_mtime, timezone.utc)
+            return SavedSession(session_id, [], 0, 0, updated, title)
         raise ValueError("会话没有完整记录")
     history = ModelMessagesTypeAdapter.validate_python([m for turn in turns for m in turn.messages])
     title = "未命名会话"
@@ -115,17 +125,21 @@ def load_session(session_id: str) -> SavedSession:
         if title != "未命名会话":
             break
     last = turns[-1]
-    return SavedSession(session_id, history, last.input_tokens, last.output_tokens, last.saved_at, title)
+    updated = max(last.saved_at, datetime.fromtimestamp(task_path.stat().st_mtime, timezone.utc)) if tasks is not None else last.saved_at
+    return SavedSession(session_id, history, last.input_tokens, last.output_tokens, updated, title)
 
 
 def list_sessions() -> tuple[list[SavedSession], list[str]]:
     """扫描当前项目会话；单个文件损坏不阻止其他会话恢复，也不删除坏文件。"""
     sessions = []
     unreadable = []
-    for path in SESSION_DIR.glob("*.jsonl"):
+    # 独立任务在失败轮次也会保存，所以同时发现尚无聊天记录的任务会话。
+    ids = {path.stem for path in SESSION_DIR.glob("*.jsonl")}
+    ids.update(path.name.removesuffix(".tasks.json") for path in SESSION_DIR.glob("*.tasks.json"))
+    for session_id in sorted(ids):
         try:
-            sessions.append(load_session(path.stem))
+            sessions.append(load_session(session_id))
         except (OSError, ValueError) as error:
-            unreadable.append(f"{path.name}（{type(error).__name__}）")
+            unreadable.append(f"{session_id}（{type(error).__name__}）")
     sessions.sort(key=lambda session: session.updated_at, reverse=True)
     return sessions, unreadable

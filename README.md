@@ -20,6 +20,7 @@
 - 权限审批：执行前检查工具及完整参数，支持四种模式、临时授权与拒绝说明。
 - 自动审批：`auto` 模式由独立模型请求审查操作，无法自动放行时回退人工确认。
 - 主动提问：模型可批量澄清需求，终端支持单选、多选、自定义回答和取消。
+- 任务管理：四个任务工具维护多步计划，独立保存进度，请求前注入清单并在终端展示。
 
 ## 快速开始
 
@@ -156,6 +157,38 @@ API_KEY=你的DeepSeek密钥
 
 取消返回 `{"status":"cancelled","answers":[]}`。回答以工具结果进入主模型历史，成功轮次照常保存和恢复。程序另附不发送给模型的 `metadata` 来源标记；auto 审批只从带此标记的真实提问结果提取已确认答案，普通文件内容和工具输出仍丢弃。问题文字由模型生成，不单独构成用户授权；用户回答也不会绕过后续权限检查。
 
+### 跟踪多步任务
+
+复杂需求可以输入：“重构这个模块，先拆成任务清单，再逐项实现并验证。”模型根据需要创建任务，简单请求无需建清单。四个工具都操作当前会话的独立任务状态：
+
+| 工具 | 参数 | 作用 |
+|---|---|---|
+| `task_create` | `subject`、可选 `description` | 创建一项 `pending` 任务，返回新编号 |
+| `task_get` | `task_id` | 查看标题、完整要求和状态 |
+| `task_update` | `task_id`、可选 `status` / `subject` / `description` | 至少更新一个字段；状态可设为 `pending`、`in_progress`、`completed` 或 `deleted` |
+| `task_list` | 无 | 查看当前会话所有任务 |
+
+例如：
+
+```text
+task_create(subject="理解现有模块", description="检查入口和调用方") → id=1，pending
+task_create(subject="实现修改并测试") → id=2，pending
+task_update(task_id=1, status="in_progress") → 开始阅读
+read_file(...) → 真正读取代码
+task_update(task_id=1, status="completed") → 标记阅读完成
+task_get(task_id=2) → 查看下一项要求
+```
+
+`task_update` 只修改计划，不自动读写项目文件、不启动命令。`completed` 是模型维护的声明，Python 不会凭它验证代码已经正确；提示词要求模型实际完成并验证后再标记。允许重新设为 pending 或 in_progress，以便返工。`deleted` 只移除任务项，不删除项目文件，且旧编号不会复用。每个会话最多保留 100 项，标题最多 200 字符、描述最多 3,000 字符。
+
+任务保存为 `.sessions/<session_id>.tasks.json`，聊天仍保存为同编号的 `.jsonl`。每次创建或更新，先写同目录临时文件、同步数据、原子替换，再更新内存；保存失败不返回成功状态。任务文件被现有 `.sessions/` 忽略规则覆盖，不进入 Git。
+
+每次模型请求前，`before_model_request` 从任务存储生成最新标题和状态清单，以带来源标记的 `<system-reminder>` 追加；完整描述通过 `task_get` 按需读取。清单与聊天历史独立，因此历史丢失或未来压缩后仍能提供当前进度；当前项目尚未实现上下文压缩。任务提醒不作为 auto 审批的用户授权，后续文件和命令工具仍经过权限检查。
+
+任务创建或更新后立即打印清单，主输入前也显示；`/tasks` 可本地查看，无需请求模型。`/new` 切换到空清单，旧文件保留；`/resume` 恢复所选会话的任务，不重跑旧工具。若第一轮中途失败，只有任务文件、还没有完整聊天轮次，也可从 `/resume` 找回计划，此时聊天历史为空。
+
+任务管理工具在所有权限模式下直接允许，它们只维护受限的会话计划文件。模型负责决定是否建计划、何时更新；清单不会强制执行某种顺序，也不会让未完成任务自动运行。任务写入是即时的，一轮失败时已保存的任务进度保留；多进程同时编辑同一会话不提供冲突合并。
+
 ### 本地命令
 
 | 命令 | 作用 |
@@ -164,6 +197,7 @@ API_KEY=你的DeepSeek密钥
 | `/new` | 保存当前历史，开启独立的新会话；保留旧会话文件 |
 | `/resume` | 列出当前项目的已保存会话，输入编号恢复 |
 | `/status` | 显示会话编号、模型、权限模式、历史消息数量和累计 token 用量 |
+| `/tasks` | 查看当前会话任务清单，不调用模型 |
 | `/api-detail` | 显示最近一轮每次模型调用的请求与响应摘要 |
 | `/exit` | 退出程序 |
 
@@ -180,7 +214,7 @@ API_KEY=你的DeepSeek密钥
 | `auto` | 自动允许 | 分类器审查，不放行则人工确认 | 分类器审查，不放行则人工确认 |
 | `bypass` | 自动允许 | 自动允许 | 自动允许 |
 
-`ask_user_question` 在所有模式下直接允许：无需先审批是否允许提问。其他新工具默认需要审批，在 `auto` 下先交给分类器；只有明确白名单与模式规则直接放行。审批界面完整显示工具参数，例如：
+`ask_user_question` 和四个任务工具在所有模式下直接允许：提问只收集回答，任务工具只维护独立计划。其他新工具默认需要审批，在 `auto` 下先交给分类器；只有明确白名单与模式规则直接放行。审批界面完整显示工具参数，例如：
 
 ```text
 工具执行需要确认：write_file
@@ -267,6 +301,7 @@ edit_file(path="config.py", old_string="timeout = 10", new_string="timeout = 30"
 coding-agent-cli/
 ├── main.py               # 入口、输入循环、命令分流和结果处理
 ├── session_store.py      # JSONL 追加保存、扫描与完整消息恢复
+├── task_store.py         # 独立任务状态、原子保存、会话切换与任务提醒
 ├── permissions.py        # 四种权限模式、审批输入和本次运行的临时授权
 ├── classifier.py         # 对话转写、独立模型审查与严格裁决校验
 ├── file_state.py         # 文件版本、已读行区间与会话内线程锁
@@ -275,7 +310,7 @@ coding-agent-cli/
 ├── agent/
 │   ├── __init__.py       # Agent 包的公开接口
 │   ├── core.py           # 加载配置，组装模型、工具和 hooks
-│   ├── tools.py          # 分页读取、完整写入、局部编辑和执行命令
+│   ├── tools.py          # 文件、命令、主动提问和四个任务工具
 │   └── hooks.py          # 模型调用日志、执行前审批与未知工具异常修正
 ├── ui/
 │   ├── __init__.py       # UI 包标识
@@ -291,6 +326,7 @@ coding-agent-cli/
 ├── test_file_mentions.py # @补全、首次请求带内容、编辑与持久化测试
 ├── test_context_injection.py # 动态约定、外部修改、提醒来源与恢复测试
 ├── test_user_questions.py # 提问表单按键、SDK 等待回答、来源过滤与恢复测试
+├── test_task_management.py # 任务持久化、失败恢复、会话隔离与请求提醒测试
 ├── requirements.txt      # Python 依赖
 └── 项目阅读路线.md         # 分阶段阅读顺序与调用链路
 ```
@@ -349,7 +385,7 @@ flowchart LR
 ### 离线验证
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit test_file_mentions test_context_injection test_user_questions
+.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit test_file_mentions test_context_injection test_user_questions test_task_management
 ```
 
 测试使用模拟模型和 HTTP 传输，不访问真实 DeepSeek，不使用真实 API Key。覆盖逐步展示、限流恢复、鉴权失败、工具故障及重试耗尽、会话保留和中断等场景。

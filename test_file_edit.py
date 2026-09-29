@@ -258,7 +258,7 @@ class FileEditIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_resume_requires_fresh_file_read(self):
         state = SessionState()
         state.permissions.files.read_file_state["old-file"] = Mock()
-        saved = SimpleNamespace(session_id="old", history=[], input_tokens=0, output_tokens=0, updated_at=Mock(), title="title")
+        saved = SimpleNamespace(session_id="2" * 32, history=[], input_tokens=0, output_tokens=0, updated_at=Mock(), title="title")
         with patch.object(commands, "console", Mock()), patch.object(commands, "save_session"):
             with patch.object(commands, "list_sessions", return_value=([saved], [])), patch.object(commands, "load_session", return_value=saved):
                 with patch.object(commands, "PromptSession", return_value=Mock(prompt_async=AsyncMock(return_value="1"))):

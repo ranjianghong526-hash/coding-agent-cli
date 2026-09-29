@@ -27,6 +27,7 @@ from ui.commands import (
     SessionState,
     console,
     print_part,
+    print_tasks,
     print_divider,
     print_welcome_banner,
 )
@@ -54,6 +55,8 @@ async def read_user_input(state: SessionState | None = None):
     打印上横线并读一行用户输入；回车后再补一条下横线，让输入在滚动历史里保持上下边界。返回 None 表示用户希望退出（Ctrl-C / Ctrl-D）。
     """
     print_divider()
+    if state is not None:
+        print_tasks(state)
     try:
         # 去掉首尾空白；空输入会由 main() 跳过，不会发送给模型。
         # main() 已运行在事件循环中，使用异步输入，避免同步 prompt() 嵌套事件循环。
@@ -136,6 +139,7 @@ async def run_agent(user_input: str, state: SessionState):
     """
     completed = False
     try:
+        state.permissions.tasks.bind(state.session_id)
         injected = await asyncio.to_thread(prepare_file_messages, user_input, state.permissions.files)
         # 新列表不提前改写 state.history：只有整轮成功后 apply_result 才提交历史。
         history = state.history + injected
@@ -158,6 +162,8 @@ async def run_agent(user_input: str, state: SessionState):
                         async for event in events:
                             if isinstance(event, FunctionToolResultEvent):
                                 print_part(event.part)
+                                if event.part.tool_name in ("task_create", "task_update"):
+                                    print_tasks(state)
             completed = True
             return agent_run.result
     finally:
@@ -184,7 +190,7 @@ def print_run_error(error: Exception) -> None:
     else:
         message = f"本轮执行失败（{type(error).__name__}），请检查网络或运行环境后再试。"
     console.print(message, style="red", markup=False)
-    console.print("可以继续输入；本轮未保存到对话历史，已执行的文件或命令操作不会自动撤销。\n")
+    console.print("可以继续输入；本轮未保存到对话历史，已保存的任务进度及已执行的文件或命令操作不会自动撤销。\n")
 
 
 async def main():

@@ -70,6 +70,9 @@ async def _record_request(ctx, request_context):
     # SDK 在每次模型请求前调用，包括同一轮工具完成后的再次请求。
     if isinstance(ctx.deps, PermissionState):
         reminder = await asyncio.to_thread(collect_external_changes, ctx.deps.files)
+        # 聊天历史可能很长；每次请求都从独立状态生成最新任务清单。
+        task_reminder = ctx.deps.tasks.reminder()
+        reminder = "\n\n".join(text for text in (reminder, task_reminder) if text)
         if reminder:
             # 创建新列表；SDK 会将处理后的消息保存为本轮真实历史。
             request_context = replace(

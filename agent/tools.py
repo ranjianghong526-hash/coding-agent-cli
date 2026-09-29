@@ -11,7 +11,7 @@ import stat
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field
 from pydantic_ai import RunContext, Tool
@@ -20,6 +20,31 @@ from pydantic_ai.messages import ToolReturn
 from file_state import FileContext, FileVersion, ReadFileState
 from permissions import PermissionState
 from ui.questions import Question, USER_ANSWER_METADATA, ask_questions
+from task_store import TaskStatus
+
+
+def task_create(ctx: RunContext[PermissionState], subject: Annotated[str, Field(min_length=1, max_length=200)],
+                description: Annotated[str, Field(max_length=3000)] = "") -> dict:
+    """创建多步计划中的一项任务，初始 pending。subject 是简短标题，description 是具体要求；不要把用户未授权的操作当作已授权。"""
+    return ctx.deps.tasks.create(subject, description)
+
+
+def task_get(ctx: RunContext[PermissionState], task_id: Annotated[int, Field(ge=1, strict=True)]) -> dict:
+    """按编号读取任务的标题、完整要求与当前状态。"""
+    return ctx.deps.tasks.get(task_id)
+
+
+def task_list(ctx: RunContext[PermissionState]) -> dict:
+    """列出当前会话全部任务；继续复杂工作前检查未完成项，不要重复创建已有计划。"""
+    return {"tasks": ctx.deps.tasks.list()}
+
+
+def task_update(ctx: RunContext[PermissionState], task_id: Annotated[int, Field(ge=1, strict=True)],
+                status: TaskStatus | Literal["deleted"] | None = None,
+                subject: Annotated[str, Field(min_length=1, max_length=200)] | None = None,
+                description: Annotated[str, Field(max_length=3000)] | None = None) -> dict:
+    """更新任务字段；开始时 in_progress，实际完成并验证后 completed，待办 pending；deleted 仅删除清单项，不删除项目文件。"""
+    return ctx.deps.tasks.update(task_id, status=status, subject=subject, description=description)
 
 
 async def ask_user_question(
@@ -227,6 +252,10 @@ def run_command(command: str) -> str:
 # JSON Schema 是工具参数的结构说明：模型据此知道有哪些参数及其类型。
 # 工具 docstring 也会参与模型看到的说明，因此教学细节主要放在 # 注释里。
 TOOLS = [
+    Tool(task_create, sequential=True),
+    Tool(task_get, sequential=True),
+    Tool(task_update, sequential=True),
+    Tool(task_list, sequential=True),
     Tool(ask_user_question, sequential=True),
     Tool(read_file, sequential=True),
     Tool(write_file, sequential=True),

@@ -11,6 +11,7 @@ from pydantic_ai.messages import ModelMessage
 
 from classifier import classify
 from file_state import FileContext
+from task_store import TaskStore
 
 from ui.render import console
 
@@ -28,6 +29,8 @@ class PermissionState:
     approval_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # 现有 deps 是主循环共享的运行上下文，文件记录单独放在 FileContext 中。
     files: FileContext = field(default_factory=FileContext)
+    # 任务属于会话，可独立持久化；不放在易丢失或压缩的历史文本里。
+    tasks: TaskStore = field(default_factory=TaskStore)
 
     def cycle_mode(self) -> None:
         """Shift+Tab 按固定顺序切换模式，不影响正在编辑的需求。"""
@@ -39,7 +42,9 @@ def requires_approval(mode: PermissionMode, tool_name: str) -> bool:
     if mode not in MODES:
         raise ValueError("未知权限模式")
     # 提问不执行文件/命令操作，不需要先审批“是否允许问问题”。
-    if mode == "bypass" or tool_name in ("read_file", "ask_user_question"):
+    if mode == "bypass" or tool_name in (
+        "read_file", "ask_user_question", "task_create", "task_get", "task_update", "task_list",
+    ):
         return False
     return not (mode == "acceptEdits" and tool_name in ("write_file", "edit_file"))
 

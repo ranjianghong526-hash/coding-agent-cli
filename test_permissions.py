@@ -187,7 +187,7 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
         original = state.permissions
         with patch.object(commands, "save_session"):
             commands.cmd_new(state)
-            saved = SimpleNamespace(session_id="old", history=[], input_tokens=1, output_tokens=2, updated_at=Mock(), title="title")
+            saved = SimpleNamespace(session_id="1" * 32, history=[], input_tokens=1, output_tokens=2, updated_at=Mock(), title="title")
             with patch.object(commands, "list_sessions", return_value=([saved], [])), patch.object(commands, "load_session", return_value=saved):
                 with patch.object(commands, "PromptSession", return_value=Mock(prompt_async=AsyncMock(return_value="1"))):
                     await commands.cmd_resume(state)

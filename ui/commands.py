@@ -58,6 +58,10 @@ class SessionState:
     # 权限属于当前程序运行，/new 和 /resume 不重置，也不从 JSONL 恢复授权。
     permissions: PermissionState = field(default_factory=PermissionState)
 
+    def __post_init__(self):
+        # deps 中的任务存储与聊天会话使用相同编号，避免串到其他会话。
+        self.permissions.tasks.bind(self.session_id)
+
 
 @dataclass
 class Command:
@@ -198,12 +202,14 @@ def cmd_new(state: SessionState) -> bool:
     """
     # 切换前补存尚未写入的历史；失败则不清空状态，避免丢失可继续保存的内容。
     save_session(state)
+    new_id = uuid4().hex
+    state.permissions.tasks.bind(new_id)
     # 只切换当前会话，旧 JSONL 文件和工具写入的文件都保留。
     state.history.clear()
     state.input_tokens = 0
     state.output_tokens = 0
     state.last_api_calls.clear()
-    state.session_id = uuid4().hex
+    state.session_id = new_id
     state.saved_messages = 0
     state.permissions.files.clear()
     console.print("已开启新会话\n")
@@ -250,6 +256,8 @@ async def cmd_resume(state: SessionState) -> bool:
     save_session(state)
     # 列表展示之后当前会话可能刚补存过，重新加载才能拿到最新完整历史。
     selected = load_session(selected.session_id)
+    # 先校验并加载任务，再修改会话字段；坏任务文件不能导致半次切换。
+    state.permissions.tasks.bind(selected.session_id)
     state.history = selected.history
     state.session_id = selected.session_id
     state.saved_messages = len(selected.history)
@@ -259,6 +267,33 @@ async def cmd_resume(state: SessionState) -> bool:
     # 模型继续使用当前 core.py 配置；不因历史文件而偷偷切换模型。
     state.permissions.files.clear()
     console.print(f"已恢复会话 {selected.session_id}，共 {len(selected.history)} 条消息。\n")
+    print_tasks(state)
+    return True
+
+
+def print_tasks(state: SessionState) -> None:
+    """完整显示当前任务进度；使用 Text，模型生成的标题不解释成 Rich 标签。"""
+    from rich.table import Table
+    from rich.text import Text
+
+    tasks = state.permissions.tasks.list()
+    if not tasks:
+        return
+    names = {"pending": "待办", "in_progress": "进行中", "completed": "已完成"}
+    table = Table(title="当前会话任务", expand=True)
+    for heading in ("编号", "状态", "任务"):
+        table.add_column(heading)
+    for task in tasks:
+        table.add_row(str(task["id"]), names[task["status"]], Text(task["subject"]))
+    console.print(table)
+
+
+def cmd_tasks(state: SessionState) -> bool:
+    """本地查看清单，不发起模型请求、不重新执行任务。"""
+    if state.permissions.tasks.list():
+        print_tasks(state)
+    else:
+        console.print("当前会话没有任务。\n")
     return True
 
 
@@ -297,6 +332,7 @@ def cmd_api_detail(state: SessionState) -> bool:
 # 命令名 -> Command 对象；handler 只接收共享 state，统一用 bool 控制是否继续。
 # 添加命令时定义 cmd_* 函数并在此注册，main.py 的分发逻辑通常无需修改。
 COMMANDS = {
+    "tasks": Command("tasks", "查看当前会话的任务清单", cmd_tasks),
     "new": Command("new", "开启新会话", cmd_new),
     "resume": Command("resume", "选择并恢复当前项目的历史会话", cmd_resume),
     "status": Command("status", "显示当前会话状态", cmd_status),

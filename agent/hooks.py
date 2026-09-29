@@ -11,6 +11,7 @@ hook（钩子）是框架在指定时机自动调用的函数：请求前检查�
 import asyncio
 from dataclasses import dataclass, field, replace
 from typing import Any
+from pydantic_core import to_jsonable_python
 
 from pydantic_ai.capabilities import Hooks
 from pydantic_ai import ModelRetry
@@ -58,7 +59,16 @@ async def _approve_tool(ctx, *, call, tool_def, args):
         # 调用方必须明确传入权限状态；漏传时不能绕过审批直接执行工具。
         raise SkipToolExecution("[权限拒绝] 缺少权限上下文，工具未执行。")
     # ctx.messages 包括本轮真实用户输入和模型刚提出的工具调用，不能只传上轮历史。
-    await check_permission(ctx.deps, call.tool_name, args, ctx.messages)
+    # SDK 校验后，嵌套参数可能已变成 Pydantic 对象；审批/分类器需要 JSON 数据。
+    # 只转换审批副本，return args 仍把原来的校验对象交给真正工具。
+    try:
+        await check_permission(ctx.deps, call.tool_name, to_jsonable_python(args), ctx.messages)
+    except SkipToolExecution:
+        if call.tool_name in ("memory_write", "memory_delete"):
+            # 拒绝也使尚未落盘的旧后台任务失效，不能在提示拒绝后悄悄写回。
+            with ctx.deps.memory.lock:
+                ctx.deps.memory.manual_epoch += 1
+        raise
     return args
 
 

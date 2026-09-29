@@ -297,6 +297,13 @@ def cmd_tasks(state: SessionState) -> bool:
     return True
 
 
+def cmd_memory(state: SessionState) -> bool:
+    """只读本地记忆索引，不发起模型请求；正文可在 Markdown 文件中人工检查和编辑。"""
+    console.print(f"长期记忆目录：{state.permissions.memory.directory}", markup=False)
+    console.print(state.permissions.memory.index(), markup=False)
+    return True
+
+
 def cmd_api_detail(state: SessionState) -> bool:
     """
     显示最近一轮 user input 触发的所有 model API 调用元数据。
@@ -332,6 +339,7 @@ def cmd_api_detail(state: SessionState) -> bool:
 # 命令名 -> Command 对象；handler 只接收共享 state，统一用 bool 控制是否继续。
 # 添加命令时定义 cmd_* 函数并在此注册，main.py 的分发逻辑通常无需修改。
 COMMANDS = {
+    "memory": Command("memory", "查看项目长期记忆索引及存储目录", cmd_memory),
     "tasks": Command("tasks", "查看当前会话的任务清单", cmd_tasks),
     "new": Command("new", "开启新会话", cmd_new),
     "resume": Command("resume", "选择并恢复当前项目的历史会话", cmd_resume),

@@ -12,6 +12,7 @@ from pydantic_ai.messages import ModelMessage
 from classifier import classify
 from file_state import FileContext
 from task_store import TaskStore
+from memory_store import MemoryStore
 
 from ui.render import console
 
@@ -31,6 +32,8 @@ class PermissionState:
     files: FileContext = field(default_factory=FileContext)
     # 任务属于会话，可独立持久化；不放在易丢失或压缩的历史文本里。
     tasks: TaskStore = field(default_factory=TaskStore)
+    # 长期记忆按项目共享；切换/恢复会话不更换这个对象，不恢复执行授权。
+    memory: MemoryStore = field(default_factory=MemoryStore)
 
     def cycle_mode(self) -> None:
         """Shift+Tab 按固定顺序切换模式，不影响正在编辑的需求。"""
@@ -43,10 +46,10 @@ def requires_approval(mode: PermissionMode, tool_name: str) -> bool:
         raise ValueError("未知权限模式")
     # 提问不执行文件/命令操作，不需要先审批“是否允许问问题”。
     if mode == "bypass" or tool_name in (
-        "read_file", "ask_user_question", "task_create", "task_get", "task_update", "task_list",
+        "read_file", "memory_read", "ask_user_question", "task_create", "task_get", "task_update", "task_list",
     ):
         return False
-    return not (mode == "acceptEdits" and tool_name in ("write_file", "edit_file"))
+    return not (mode == "acceptEdits" and tool_name in ("write_file", "edit_file", "memory_write"))
 
 
 async def ask_permission(tool_name: str, args: dict[str, Any]) -> tuple[bool, bool, str]:

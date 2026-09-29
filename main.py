@@ -8,6 +8,7 @@ import asyncio
 from inspect import isawaitable
 
 from session_store import save_session
+from memory_worker import MemoryWorker
 
 from pydantic_ai import Agent, FunctionToolResultEvent
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
@@ -197,40 +198,53 @@ async def main():
     """维护一份会话状态，持续接收用户输入，直到命令或输入信号要求退出。"""
     # 默认启动新会话；每轮成功后保存到磁盘，需要旧历史时输入 /resume。
     state = SessionState(model_name=MODEL_NAME)
+    memory_worker = MemoryWorker(state.permissions.memory)
     print_welcome_banner("Coding Agent")
 
-    while True:
-        # 读用户输入
-        user_input = await read_user_input(state)
-        if user_input is None:
-            # None 表示退出；空字符串表示只按了回车，二者含义不同。
-            break
-        if not user_input:
-            continue
-
-        try:
-            # 先清空临时日志，防止本地命令抛错时把上一轮用量再次累计。
-            api_call_log.clear()
-            # /new、/status 等命令在本地完成，不触发模型请求。
-            action = await handle_command(user_input, state)
-            if action == "break":
+    try:
+        while True:
+            # 后台信息集中在下一次提示前显示，不与用户正在输入的文字交错。
+            for notice in memory_worker.notices:
+                console.print(notice, style="yellow", markup=False)
+            memory_worker.notices.clear()
+            # 读用户输入
+            user_input = await read_user_input(state)
+            if user_input is None:
+                # None 表示退出；空字符串表示只按了回车，二者含义不同。
                 break
-            if action == "continue":
+            if not user_input:
                 continue
 
-            result = await run_agent(user_input, state)
-            apply_result(state, result)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            # 用户主动中断不是工具故障，不自动重试，结束程序。
-            console.print("\n任务已中断，退出程序。")
-            break
-        except Exception as error:
-            # CLI 最外层安全网捕获未知错误；只中止本轮，不重新执行可能有副作用的工具。
-            # 历史仍保留上一轮成功状态，避免将未配对的工具调用传给下一轮模型。
-            state.last_api_calls = list(api_call_log)
-            state.input_tokens += sum(call.input_tokens for call in api_call_log)
-            state.output_tokens += sum(call.output_tokens for call in api_call_log)
-            print_run_error(error)
+            try:
+                # 先清空临时日志，防止本地命令抛错时把上一轮用量再次累计。
+                api_call_log.clear()
+                # /new、/status 等命令在本地完成，不触发模型请求。
+                action = await handle_command(user_input, state)
+                if action == "break":
+                    break
+                if action == "continue":
+                    continue
+
+                result = await run_agent(user_input, state)
+                apply_result(state, result)
+                # 只用成功轮次的新用户消息提炼；失败轮次和已有历史不会反复保存。
+                memory_worker.schedule(result.new_messages())
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # 用户主动中断不是工具故障，不自动重试，结束程序。
+                console.print("\n任务已中断，退出程序。")
+                break
+            except Exception as error:
+                # CLI 最外层安全网捕获未知错误；只中止本轮，不重新执行可能有副作用的工具。
+                # 历史仍保留上一轮成功状态，避免将未配对的工具调用传给下一轮模型。
+                state.last_api_calls = list(api_call_log)
+                state.input_tokens += sum(call.input_tokens for call in api_call_log)
+                state.output_tokens += sum(call.output_tokens for call in api_call_log)
+                print_run_error(error)
+
+    finally:
+        await memory_worker.finish()
+        for notice in memory_worker.notices:
+            console.print(notice, style="yellow", markup=False)
 
 
 # 直接执行 python main.py 时启动交互；被其他模块导入时不自动进入主循环。

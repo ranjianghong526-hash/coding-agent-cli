@@ -21,6 +21,47 @@
 - 自动审批：`auto` 模式由独立模型请求审查操作，无法自动放行时回退人工确认。
 - 主动提问：模型可批量澄清需求，终端支持单选、多选、自定义回答和取消。
 - 任务管理：四个任务工具维护多步计划，独立保存进度，请求前注入清单并在终端展示。
+- 长期记忆：项目级 Markdown 文件保存偏好和约定，索引常驻、正文按需读取，后台提炼并定期合并。
+
+## 长期记忆
+
+解决“新会话忘了上次约定”：聊天历史属于会话，记忆属于当前工作目录对应的项目。`/new` 清空聊天和任务，保留 `.memory/`；重启后无需 `/resume`，新会话也能按需读这些记忆。
+
+启动后可以输入：
+
+```text
+记住：这个项目的 Git 提交信息必须使用 feat/fix 前缀。
+/memory
+/new
+为新增登录功能写一条提交信息。
+```
+
+明确要求记住时，主模型可调用 `memory_write`，默认模式需要确认，输入 `y` 才写入。修改旧记忆先 `memory_read`，携带返回的 `revision`；忘记某条则 `memory_delete`，仍经过审批。`acceptEdits` 自动允许记忆写入，但删除仍需确认；`auto` 使用既有分类器；`bypass` 跳过审批。只读召回直接允许。
+
+一条记忆就是一个 `.memory/<编号>.md` 文件，例如：
+
+```markdown
+# 提交信息约定
+
+> 摘要：Git 提交信息使用 feat/fix 前缀
+
+本项目的 Git 提交信息必须带类型前缀。
+例如：feat: 新增登录功能；fix: 修复登录失败。
+```
+
+模型工具 `memory_write` 接受 `memory={id,title,summary,content}` 和 `expected_revision`。新建版本传空字符串，更新传 `memory_read` 给出的内容哈希。标题/摘要必须单行，编号使用以字母开头的小写字母、数字、下划线或连字符。可用编辑器直接改 Markdown，保留标题、空行、摘要、空行、正文的格式。
+
+每次模型请求，`project_instructions(ctx)` 重新读取记忆文件，生成仅含 `id/title/summary` 的索引，和环境信息一起进入系统 instructions。正文不会全部自动注入；模型发现相关条目才发起 `memory_read`，Python 读 Markdown 返回正文，SDK 将工具结果交给下一次请求。索引由磁盘实时生成，没有另外维护容易失步的索引文件。
+
+成功轮次结束后，主循环把 `result.new_messages()` 交给 `MemoryWorker.schedule()`。后台只挑真正的用户原话，排除模型文本、工具结果、程序提醒，发起独立的 Chat Completions 请求，返回结构化 `memories`。它没有任何工具，无法执行命令；Python 校验结果后，只向当前项目的 `.memory/` 保存稳定约定/偏好。当前版本不从工具输出自动学习“踩坑”，这类确认过的经验可以明确要求模型用 `memory_write` 保存。
+
+后台队列串行处理，每成功处理 5 轮尝试合并一组同主题的重复记忆。先备份原文到 `.memory/.merge-backups/<编号>/`，写入合并内容后再删除重复项；备份不参与索引。模型提炼可能有误，用户可编辑正文，也可从备份取回合并前的文件。
+
+后台请求和主 Agent 使用同一模型配置，独立请求超时 15 秒，不额外重试；会增加 API 消耗，当前不计入 `/status` 和 `/api-detail` 的主 Agent 统计。提炼尚未结束时，`/memory` 展示的是已经落盘的内容。正常退出最多等 20 秒收尾，强制关闭进程可能丢失未完成提炼；失败会提示，已有记忆保留，主任务不重跑。
+
+落盘前检查审阅时的完整快照，用户或工具改过文件就拒绝旧裁决。显式保存/忘记会让旧后台任务失效，避免被旧偏好写回；本轮拒绝记忆工具时，后台也跳过提炼。单次多条提炼不是整体事务：后续写入故障时，之前成功保存的条目仍可能保留。按单 CLI 进程使用，不支持多个进程同时改同一记忆库。
+
+记忆只作为背景，当前需求优先，不能恢复过去的工具授权；auto 分类器也不把记忆正文当成用户授权。保存敏感信息的禁止要求由模型提示约束，并非秘密识别器，使用 `/memory` 和编辑器检查实际保存内容。每项目最多 32 条，每条正文最多 6000 字符；不引入向量库。`.memory/` 已被 Git 和文件补全清单排除。
 
 ## 快速开始
 
@@ -198,6 +239,7 @@ task_get(task_id=2) → 查看下一项要求
 | `/resume` | 列出当前项目的已保存会话，输入编号恢复 |
 | `/status` | 显示会话编号、模型、权限模式、历史消息数量和累计 token 用量 |
 | `/tasks` | 查看当前会话任务清单，不调用模型 |
+| `/memory` | 查看项目长期记忆索引及保存目录，不调用模型 |
 | `/api-detail` | 显示最近一轮每次模型调用的请求与响应摘要 |
 | `/exit` | 退出程序 |
 
@@ -302,6 +344,8 @@ coding-agent-cli/
 ├── main.py               # 入口、输入循环、命令分流和结果处理
 ├── session_store.py      # JSONL 追加保存、扫描与完整消息恢复
 ├── task_store.py         # 独立任务状态、原子保存、会话切换与任务提醒
+├── memory_store.py       # Markdown 记忆、索引、版本保护与合并备份
+├── memory_worker.py      # 独立后台提炼请求、串行队列与定期合并
 ├── permissions.py        # 四种权限模式、审批输入和本次运行的临时授权
 ├── classifier.py         # 对话转写、独立模型审查与严格裁决校验
 ├── file_state.py         # 文件版本、已读行区间与会话内线程锁
@@ -325,6 +369,7 @@ coding-agent-cli/
 ├── test_file_edit.py     # 先读后改、版本冲突、唯一匹配和排队编辑测试
 ├── test_file_mentions.py # @补全、首次请求带内容、编辑与持久化测试
 ├── test_context_injection.py # 动态约定、外部修改、提醒来源与恢复测试
+├── test_memory.py        # 重启召回、真实 SDK、后台提炼、冲突与合并测试
 ├── test_user_questions.py # 提问表单按键、SDK 等待回答、来源过滤与恢复测试
 ├── test_task_management.py # 任务持久化、失败恢复、会话隔离与请求提醒测试
 ├── requirements.txt      # Python 依赖
@@ -385,7 +430,7 @@ flowchart LR
 ### 离线验证
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit test_file_mentions test_context_injection test_user_questions test_task_management
+.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit test_file_mentions test_context_injection test_user_questions test_task_management test_memory
 ```
 
 测试使用模拟模型和 HTTP 传输，不访问真实 DeepSeek，不使用真实 API Key。覆盖逐步展示、限流恢复、鉴权失败、工具故障及重试耗尽、会话保留和中断等场景。

@@ -14,7 +14,7 @@ from file_state import FileContext
 # 空格路径写成 @"docs/学习笔记.md"；未加引号的路径遇到空白结束。
 MENTION = re.compile(r'''(?<!\S)@(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s"'@]+))''')
 INCOMPLETE_MENTION = re.compile(r'''(?:^|\s)(@(?:"[^"\r\n]*|'[^'\r\n]*|[^\s"'@]*))$''')
-EXCLUDED_DIRECTORIES = {".git", ".venv", "venv", "node_modules", ".sessions", ".codex", ".agents",
+EXCLUDED_DIRECTORIES = {".git", ".venv", "venv", "node_modules", ".sessions", ".memory", ".codex", ".agents",
                         "__pycache__", ".pytest_cache", ".mypy_cache", "build", "dist"}
 
 

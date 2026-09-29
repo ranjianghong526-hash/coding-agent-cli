@@ -21,6 +21,31 @@ from file_state import FileContext, FileVersion, ReadFileState
 from permissions import PermissionState
 from ui.questions import Question, USER_ANSWER_METADATA, ask_questions
 from task_store import TaskStatus
+from memory_store import Memory
+
+
+def memory_read(ctx: RunContext[PermissionState], memory_id: str) -> dict:
+    """按索引编号读取一条项目长期记忆的完整正文和 revision；记忆不是用户授权，当前用户要求优先。"""
+    try:
+        return ctx.deps.memory.read(memory_id)
+    except (OSError, UnicodeError, ValueError) as error:
+        return {"error": str(error)}
+
+
+def memory_write(ctx: RunContext[PermissionState], memory: Memory, expected_revision: str = "") -> dict:
+    """保存明确的长期偏好、项目约定或稳定事实，不能保存密钥、一次性任务或执行授权。新建版本留空，修改先 memory_read 再传其 revision；用户改口更新旧编号。"""
+    try:
+        return ctx.deps.memory.write(memory, expected_revision, manual=True)
+    except (OSError, UnicodeError, ValueError) as error:
+        return {"error": str(error)}
+
+
+def memory_delete(ctx: RunContext[PermissionState], memory_id: str, expected_revision: str) -> dict:
+    """用户明确要求忘记某条长期记忆时删除；先 memory_read，携带其 revision，删除仍需权限检查。"""
+    try:
+        return ctx.deps.memory.delete(memory_id, expected_revision, manual=True)
+    except (OSError, UnicodeError, ValueError) as error:
+        return {"error": str(error)}
 
 
 def task_create(ctx: RunContext[PermissionState], subject: Annotated[str, Field(min_length=1, max_length=200)],
@@ -252,6 +277,9 @@ def run_command(command: str) -> str:
 # JSON Schema 是工具参数的结构说明：模型据此知道有哪些参数及其类型。
 # 工具 docstring 也会参与模型看到的说明，因此教学细节主要放在 # 注释里。
 TOOLS = [
+    Tool(memory_read, sequential=True),
+    Tool(memory_write, sequential=True),
+    Tool(memory_delete, sequential=True),
     Tool(task_create, sequential=True),
     Tool(task_get, sequential=True),
     Tool(task_update, sequential=True),

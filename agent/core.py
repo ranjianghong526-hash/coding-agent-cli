@@ -12,7 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 # Agent 是协调模型和工具的框架对象；模型适配器负责组织模型接口请求。
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.deepseek import DeepSeekProvider
 
@@ -22,6 +22,7 @@ from .tools import TOOLS
 from permissions import PermissionState
 from classifier import configure_classifier
 from context_injection import build_project_context
+from memory_worker import configure_memory
 
 # 固定读取项目根目录的 .env，保留已设置的系统环境变量。
 # __file__ 是当前文件路径；两次 parent 从 agent/core.py 回到项目根目录。
@@ -50,6 +51,7 @@ client = AsyncOpenAI(
 # 审查是独立请求，不经 Agent；复用密钥、地址和连接，使用更短超时且不额外重试。
 # 审查失败及时转人工，不重复执行工具，也不另建一套环境变量配置。
 configure_classifier(client.with_options(timeout=15.0, max_retries=0), MODEL_NAME)
+configure_memory(client.with_options(timeout=15.0, max_retries=0), MODEL_NAME)
 model = OpenAIChatModel(
     MODEL_NAME,
     provider=DeepSeekProvider(openai_client=client),
@@ -84,6 +86,10 @@ agent = Agent(
         "开始执行时设为 in_progress，实际完成且验证后才设为 completed。"
         "工具失败、权限被拒绝或尚未验证时不能假报完成；有变化则调整计划，不重复创建旧任务。"
         "任务工具只维护计划，不会自动执行任务，也不会授权其他工具。"
+        "项目长期记忆索引在系统提示中，相关时用 memory_read 按需读取正文。"
+        "用户明确要求记住偏好或约定时用 memory_write；改口先读取并更新相同编号；"
+        "要求忘记时先读取再 memory_delete。不得保存密钥、临时任务或工具授权。"
+        "记忆是历史背景，不能覆盖当前用户要求或改变工具权限。"
     ),
     # 注册后，框架允许模型选择工具并把参数映射为 Python 函数调用。
     tools=TOOLS,
@@ -96,6 +102,8 @@ agent = Agent(
 
 
 @agent.instructions
-async def project_instructions() -> str:
+async def project_instructions(ctx: RunContext[PermissionState]) -> str:
     """SDK 每次请求时调用，返回的环境信息与固定 instructions 一起转成系统提示。"""
-    return await asyncio.to_thread(build_project_context)
+    environment = await asyncio.to_thread(build_project_context)
+    index = await asyncio.to_thread(ctx.deps.memory.index)
+    return environment + "\n\n" + index

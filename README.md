@@ -11,6 +11,7 @@
 - 文件工具：带行号分页读取 UTF-8 文件、完整写入或唯一文本局部替换。
 - 文件保护：先读后改、版本核对、重复读取去重与同一轮编辑排队执行。
 - 文件引用：输入 `@` 选择项目文件，提交前预读，第一次模型请求即包含文件内容。
+- 上下文注入：自动提供运行环境与 AGENTS.md 项目约定，请求前提醒已读文件的外部变化。
 - 命令工具：执行 shell 命令，返回输出和失败信息。
 - 逐步展示：模型返回时显示文本与工具调用，每个工具返回时立即显示结果。
 - 会话统计：查看累计 token 用量，以及最近一轮模型 API 调用详情。
@@ -98,6 +99,45 @@ API_KEY=你的DeepSeek密钥
 5. 成功后照常保存完整历史，`/resume` 可恢复这些消息。失败轮次不提交历史，同时清空文件读取登记，避免把未进入历史的内容记为模型已读。
 
 文件正文属于工具结果，不能拼接成用户授权。auto 分类器沿用原有过滤规则，会丢弃文件正文，只保留你的原话和工具调用。预读不额外消耗一次模型请求，但发送的文件内容仍计入主模型的输入用量。`@` 引用本身只读文件，不自动允许后续写入。
+
+### 自动注入项目上下文
+
+系统上下文分三类：
+
+| 类型 | 内容 | 注入位置 |
+|---|---|---|
+| 固定 instructions | 编程助手身份、先读后改、尊重权限拒绝 | `agent/core.py` 的 `Agent(instructions=...)` |
+| 动态 instructions | 当前时间与时区、工作目录、操作系统、项目文件路径、Git 状态、AGENTS.md | `@agent.instructions` 回调，每次模型请求重新生成 |
+| 实时提醒 | 已读文件被外部修改、删除或无法核对 | `before_model_request` 中追加普通请求消息 |
+
+从项目根目录启动，在该目录放置 UTF-8 的 `AGENTS.md`，例如：
+
+```markdown
+# 项目约定
+- Python 变量名使用 snake_case。
+- 注释使用中文。
+- 优先修改现有实现，不新增无必要依赖。
+```
+
+随后正常提出需求，程序会自动加载约定，不需要每次重复粘贴或要求模型自行读取。当前仅加载工作目录根部的 `AGENTS.md`，不递归加载子目录或父目录规则。目录信息只提供文件路径，默认最多 100 个；AGENTS.md 最多 10,000 字符，Git 状态最多 6,000 字符，超限标明截断。普通项目文件的正文不会因为环境采集而自动发送；按需使用 `@` 或 `read_file`。
+
+动态回调使用后台线程，每次模型请求都会重新读取环境，包括同一轮工具执行后的后续请求，因此约定、日期和 Git 状态不使用 LRU 缓存。Git 不可用、非仓库或 AGENTS.md 编码错误会作为明确的环境状态交给模型，不因此终止任务。
+
+文件变化示例：
+
+```text
+模型读取 config.py，看到 timeout = 10
+你在编辑器中改成 timeout = 20
+下一次模型请求前，程序检测到版本变化
+  → 注入提醒：“旧工具结果可能过期，请重新 read_file”
+  → 模型可选择重新读取，再依据当前正文处理
+```
+
+检测复用已有修改时间、大小、文件身份和 SHA-256 版本比较，保留修改时间的内容变化也能发现。每个变化后的版本只提醒一次；模型自己通过文件工具成功编辑会刷新已读版本，不被误判为外部修改。提醒不直接发送新正文、不把新版本登记为已读，也不会替用户撤销磁盘修改。模型忽略提醒时，现有文件工具仍会拒绝用过期版本写入。
+
+提醒使用 `ModelRequest(UserPromptPart(...))`，正文带 `<system-reminder>` 标签，消息元数据另标明 `context_injection="system-reminder"`。它走普通对话通道，默认不在 CLI 显示；成功轮次与完整历史一起保存，恢复后仍能识别来源。SDK 发送前可能合并相邻请求；元数据只供程序识别，不会发送给模型。auto 分类器从原始历史中排除这类消息，不把它们算作用户授权；用户亲自输入相同标签仍保留为真实用户输入。
+
+环境信息和提醒不额外调用一次模型，但会增加主模型的输入用量。每次请求检查已读文件时会重新读取字节核对摘要，大量或很大的已读文件会增加本地 I/O；单次最多提醒 50 个文件，未处理的变化留到后续请求。它提供提醒和版本保护，不是实时文件监控，也不能消除检查后文件再次变化的竞争窗口。
 
 ### 本地命令
 
@@ -214,6 +254,7 @@ coding-agent-cli/
 ├── classifier.py         # 对话转写、独立模型审查与严格裁决校验
 ├── file_state.py         # 文件版本、已读行区间与会话内线程锁
 ├── file_mentions.py      # @补全、引用解析和预读工具消息
+├── context_injection.py  # 动态环境、项目约定、外部变化提醒与来源标记
 ├── agent/
 │   ├── __init__.py       # Agent 包的公开接口
 │   ├── core.py           # 加载配置，组装模型、工具和 hooks
@@ -230,6 +271,7 @@ coding-agent-cli/
 ├── test_auto_mode.py     # 自动允许、人工回退、审查协议与转写离线测试
 ├── test_file_edit.py     # 先读后改、版本冲突、唯一匹配和排队编辑测试
 ├── test_file_mentions.py # @补全、首次请求带内容、编辑与持久化测试
+├── test_context_injection.py # 动态约定、外部修改、提醒来源与恢复测试
 ├── requirements.txt      # Python 依赖
 └── 项目阅读路线.md         # 分阶段阅读顺序与调用链路
 ```
@@ -266,6 +308,8 @@ flowchart LR
 
 学习文件引用时，沿着 `FileMentionCompleter` → `extract_mentions()` → `prepare_file_messages()` → `read_file_content()` → `run_agent()` 中的历史拼接与 `prompt=None` 阅读。
 
+学习上下文注入时，沿着 `Agent(instructions=...)` → `project_instructions()` → `build_project_context()` → `before_model_request` → `collect_external_changes()` → `make_system_reminder()` → 分类器来源过滤阅读。
+
 详细步骤、学习目标和动手练习见 [项目阅读路线](项目阅读路线.md)。
 
 ## 错误处理与重试
@@ -286,7 +330,7 @@ flowchart LR
 ### 离线验证
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit test_file_mentions
+.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit test_file_mentions test_context_injection
 ```
 
 测试使用模拟模型和 HTTP 传输，不访问真实 DeepSeek，不使用真实 API Key。覆盖逐步展示、限流恢复、鉴权失败、工具故障及重试耗尽、会话保留和中断等场景。
@@ -300,6 +344,8 @@ auto 测试模拟独立 API，覆盖转写过滤与 JSON 转义、完整命令�
 文件编辑测试使用临时文件，覆盖分页去重、部分与完整读取、文件变动及删除、保持 mtime 的内容变动、唯一匹配、CRLF/BOM 保留、原子替换失败、新建时同名竞争、会话切换清空快照、多个编辑排队和 auto 审批。
 
 文件引用测试覆盖 Git 忽略、中文空格路径、真实 Tab 与 Shift+Tab 按键、多个引用去重、首次模型请求直接含正文、直接局部编辑、分页限制、读取失败、重复引用刷新、JSONL 消息往返，以及文件内容不冒充 auto 审批的用户授权。
+
+上下文测试覆盖时间与目录、AGENTS.md 自动加载和刷新、长度限制与环境失败、每次模型请求重新生成 instructions、外部修改/删除/无法核对、同 mtime 的内容变化、自己的编辑不误报、提醒去重、保留旧版本保护、SDK 合并请求、提醒不显示、auto 来源过滤和 JSONL 元数据恢复。
 
 ## 当前实现的边界
 

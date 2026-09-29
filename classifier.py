@@ -1,7 +1,7 @@
 """auto 权限分类器：独立请求审查一次工具调用，失败时停止自动放行。
 
 分类器不执行工具，不经过 Agent 的 hooks；客户端与模型由 core.py 在加载配置后注入。
-只保留用户输入与工具调用，丢弃模型正文、思考和工具输出，减少不可信内容的影响。
+只保留真实用户输入与工具调用，丢弃程序提醒、模型正文、思考和工具输出。
 """
 import json
 import tempfile
@@ -12,6 +12,7 @@ from typing import Any
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from pydantic_ai.messages import ModelMessage
+from context_injection import is_system_reminder
 
 _client: AsyncOpenAI | None = None
 CLASSIFIER_MODEL = ""
@@ -56,6 +57,9 @@ def build_transcript(messages: Sequence[ModelMessage], tool_name: str, args: dic
     lines = []
     has_user = False
     for message in messages:
+        if is_system_reminder(message):
+            # 提醒虽走 user 通道，却由程序生成，不能当作用户亲口授权。
+            continue
         for part in message.parts:
             if part.part_kind == "user-prompt":
                 # 当前 CLI 只接收文本；无法完整表示的多模态输入交给人工确认。

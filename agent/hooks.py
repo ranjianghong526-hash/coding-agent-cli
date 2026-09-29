@@ -4,11 +4,12 @@
 主循环在每轮 run_agent 之前清空 api_call_log，跑完后快照到 SessionState 里，
 /api-detail 命令再把这一轮的所有调用展示给用户。
 
-hook（钩子）是框架在指定时机自动调用的函数：请求前后记录日志，请求失败时补日志，
+hook（钩子）是框架在指定时机自动调用的函数：请求前检查文件变化并记录日志，请求失败时补日志，
 工具执行前审批，工具未知异常时转换为 ModelRetry，让模型有机会修正操作。
 日志只记录模型调用的摘要，没有保存完整的 HTTP 请求体和响应体。
 """
-from dataclasses import dataclass, field
+import asyncio
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from pydantic_ai.capabilities import Hooks
@@ -16,6 +17,7 @@ from pydantic_ai import ModelRetry
 from pydantic_ai.exceptions import SkipToolExecution
 
 from permissions import PermissionState, check_permission
+from context_injection import collect_external_changes, make_system_reminder
 
 
 # dataclass 根据字段自动生成初始化方法等，适合保存结构明确的一条调用记录。
@@ -65,8 +67,15 @@ async def _record_request(ctx, request_context):
     """
     每次发起 model 调用之前，创建一条 ApiCall 记录。
     """
-    # 装饰器把函数注册到框架；ctx 是执行上下文，此处没有使用。
-    # 使用 async 是为了符合钩子的异步接口，即便本函数没有需要 await 的操作。
+    # SDK 在每次模型请求前调用，包括同一轮工具完成后的再次请求。
+    if isinstance(ctx.deps, PermissionState):
+        reminder = await asyncio.to_thread(collect_external_changes, ctx.deps.files)
+        if reminder:
+            # 创建新列表；SDK 会将处理后的消息保存为本轮真实历史。
+            request_context = replace(
+                request_context,
+                messages=request_context.messages + [make_system_reminder(reminder)],
+            )
     msgs = list(request_context.messages)
     # 一条消息可以含多个 part（内容片段），如文本、工具调用或工具结果。
     # 先判断列表是否为空，避免用 [-1] 访问不存在的最后一项。
@@ -84,7 +93,7 @@ async def _record_request(ctx, request_context):
         last_part=last_part,
         tools=tool_names,
     ))
-    # 返回原请求上下文，不修改模型实际收到的内容。
+    # 日志在注入之后记录；SDK 随后还会合并相邻请求并转换为提供方格式。
     return request_context
 
 

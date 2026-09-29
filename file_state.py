@@ -19,6 +19,8 @@ class ReadFileState:
     version: FileVersion
     total_lines: int
     ranges: list[tuple[int, int]] = field(default_factory=list)
+    # 提醒去重与已读版本分开：发过提醒不等于模型读过变化后的正文。
+    notified_version: FileVersion | str | None = None
 
     def contains(self, start: int, end: int) -> bool:
         return any(left <= start and end <= right for left, right in self.ranges)

@@ -10,6 +10,7 @@
 - 会话持久化：每轮成功后追加保存，重启后用 `/resume` 恢复聊天上下文。
 - 文件工具：带行号分页读取 UTF-8 文件、完整写入或唯一文本局部替换。
 - 文件保护：先读后改、版本核对、重复读取去重与同一轮编辑排队执行。
+- 文件引用：输入 `@` 选择项目文件，提交前预读，第一次模型请求即包含文件内容。
 - 命令工具：执行 shell 命令，返回输出和失败信息。
 - 逐步展示：模型返回时显示文本与工具调用，每个工具返回时立即显示结果。
 - 会话统计：查看累计 token 用量，以及最近一轮模型 API 调用详情。
@@ -29,7 +30,7 @@ git clone https://github.com/ranjianghong526-hash/coding-agent-cli.git
 cd coding-agent-cli
 ```
 
-仓库为私有仓库，克隆时需要具有访问权限的 GitHub 账号。已有本地项目时，直接进入项目根目录。
+已有本地项目时，直接进入项目根目录。
 
 ### 2. 创建环境并安装依赖
 
@@ -75,6 +76,28 @@ API_KEY=你的DeepSeek密钥
 ```
 
 也可以要求 Agent 修改代码并运行验证。具体是否调用工具以及调用顺序，由模型根据需求判断。
+
+### 用 @ 引用文件
+
+```text
+解释 @main.py 的主循环
+比较 @agent/core.py 和 @agent/hooks.py
+修改 @"docs/中文 笔记.md" 的标题
+```
+
+输入 `@` 后展示候选，继续输入文件名或路径片段筛选；用上下方向键选择、Tab 补全、Enter 提交。含空格的路径自动加双引号，也可以手动输入。补全保留前面的需求文字，Shift+Tab 仍切换权限模式。引用须出现在输入开头或空白后，邮箱中的 `@` 不会识别为引用。
+
+候选来自当前工作目录。Git 项目使用 `git ls-files --cached --others --exclude-standard`，包含已跟踪和未忽略的新文件；另排除密钥、会话、依赖和缓存目录。没有 Git 时退回目录遍历，排除已知依赖目录，此时不解析 `.gitignore`。手动输入的引用不依赖候选清单，仍按真实路径读取。
+
+提交时执行以下步骤：
+
+1. `extract_mentions()` 从用户原话提取路径，同一规范化路径本轮只读一次。
+2. `prepare_file_messages()` 调用共享的 `read_file_content()`，默认展示前 200 行，并登记当前版本和已读区间。重复引用使用 `force=True` 重新展示当前正文；长文件提示模型继续分页，读取失败则提供错误结果。
+3. 程序生成三组消息：`user-prompt` 保存原话、`tool-call` 描述已执行的读取、`tool-return` 保存真实文件内容。调用和返回的 ID 一一对应；这些读取由程序预先执行，不需要模型请求，也不会再次执行。
+4. `run_agent()` 把三组消息接在旧历史后，使用 `agent.iter(None, message_history=history, ...)`。传 `None` 是因为用户原话已经在历史中，避免重复追加。第一次模型请求即可看到文件内容，后续需要编辑时仍经过现有权限与版本检查。
+5. 成功后照常保存完整历史，`/resume` 可恢复这些消息。失败轮次不提交历史，同时清空文件读取登记，避免把未进入历史的内容记为模型已读。
+
+文件正文属于工具结果，不能拼接成用户授权。auto 分类器沿用原有过滤规则，会丢弃文件正文，只保留你的原话和工具调用。预读不额外消耗一次模型请求，但发送的文件内容仍计入主模型的输入用量。`@` 引用本身只读文件，不自动允许后续写入。
 
 ### 本地命令
 
@@ -190,6 +213,7 @@ coding-agent-cli/
 ├── permissions.py        # 四种权限模式、审批输入和本次运行的临时授权
 ├── classifier.py         # 对话转写、独立模型审查与严格裁决校验
 ├── file_state.py         # 文件版本、已读行区间与会话内线程锁
+├── file_mentions.py      # @补全、引用解析和预读工具消息
 ├── agent/
 │   ├── __init__.py       # Agent 包的公开接口
 │   ├── core.py           # 加载配置，组装模型、工具和 hooks
@@ -205,6 +229,7 @@ coding-agent-cli/
 ├── test_permissions.py   # 审批拦截、授权范围、并发输入与快捷键离线测试
 ├── test_auto_mode.py     # 自动允许、人工回退、审查协议与转写离线测试
 ├── test_file_edit.py     # 先读后改、版本冲突、唯一匹配和排队编辑测试
+├── test_file_mentions.py # @补全、首次请求带内容、编辑与持久化测试
 ├── requirements.txt      # Python 依赖
 └── 项目阅读路线.md         # 分阶段阅读顺序与调用链路
 ```
@@ -215,7 +240,8 @@ coding-agent-cli/
 flowchart LR
     A[用户输入] --> B{本地命令？}
     B -->|是| C[执行命令]
-    B -->|否| D[Agent 调用模型]
+    B -->|否| M[解析 @引用并预读文件]
+    M --> D[Agent 调用模型]
     D -->|需要工具| P{权限检查}
     P -->|自动允许或人工确认| E[执行 Python 工具]
     P -->|拒绝| R[返回权限拒绝结果]
@@ -238,6 +264,8 @@ flowchart LR
 
 学习文件编辑时，沿着 `FileContext` → `read_file()` 登记 → `edit_file()` / `write_file()` 内部校验 → `_atomic_write()` → 更新读取状态阅读。
 
+学习文件引用时，沿着 `FileMentionCompleter` → `extract_mentions()` → `prepare_file_messages()` → `read_file_content()` → `run_agent()` 中的历史拼接与 `prompt=None` 阅读。
+
 详细步骤、学习目标和动手练习见 [项目阅读路线](项目阅读路线.md)。
 
 ## 错误处理与重试
@@ -258,7 +286,7 @@ flowchart LR
 ### 离线验证
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit
+.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit test_file_mentions
 ```
 
 测试使用模拟模型和 HTTP 传输，不访问真实 DeepSeek，不使用真实 API Key。覆盖逐步展示、限流恢复、鉴权失败、工具故障及重试耗尽、会话保留和中断等场景。
@@ -270,6 +298,8 @@ flowchart LR
 auto 测试模拟独立 API，覆盖转写过滤与 JSON 转义、完整命令保留、严格布尔裁决、截断响应及超时、材料过大回退、本轮用户输入进入审查、自动允许后实际写入，以及人工拒绝时不写入。
 
 文件编辑测试使用临时文件，覆盖分页去重、部分与完整读取、文件变动及删除、保持 mtime 的内容变动、唯一匹配、CRLF/BOM 保留、原子替换失败、新建时同名竞争、会话切换清空快照、多个编辑排队和 auto 审批。
+
+文件引用测试覆盖 Git 忽略、中文空格路径、真实 Tab 与 Shift+Tab 按键、多个引用去重、首次模型请求直接含正文、直接局部编辑、分页限制、读取失败、重复引用刷新、JSONL 消息往返，以及文件内容不冒充 auto 审批的用户授权。
 
 ## 当前实现的边界
 

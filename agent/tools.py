@@ -14,7 +14,7 @@ from pathlib import Path
 
 from pydantic_ai import RunContext, Tool
 
-from file_state import FileVersion, ReadFileState
+from file_state import FileContext, FileVersion, ReadFileState
 from permissions import PermissionState
 
 
@@ -76,19 +76,19 @@ def _atomic_write(path: Path, data: bytes, expected: FileVersion | None) -> File
             temporary.unlink(missing_ok=True)
 
 
-def read_file(ctx: RunContext[PermissionState], path: str, offset: int = 1, limit: int = 200, force: bool = False) -> str:
-    """读取 UTF-8 文件并显示行号；offset 从 1 开始，limit 为行数。重复读取可用 force 强制显示。"""
+def read_file_content(files: FileContext, path: str, offset: int = 1, limit: int = 200, force: bool = False) -> str:
+    """共享读取实现：模型的 read_file 与用户的 @引用使用同一份版本和已读区间登记。"""
     if offset < 1 or limit < 1:
         return "[错误] offset 和 limit 必须大于等于 1"
     key = None
     try:
         resolved, key = _path(path)
-        with ctx.deps.files.lock:
+        with files.lock:
             data, version = _read_disk(resolved)
             lines = data.decode("utf-8-sig").splitlines()
             if offset > max(1, len(lines)):
                 return f"[错误] 起始行超出文件范围，文件共 {len(lines)} 行"
-            record = ctx.deps.files.read_file_state.get(key)
+            record = files.read_file_state.get(key)
             if record is None or record.version != version:
                 record = ReadFileState(version, len(lines))
             end = min(len(lines), offset + limit - 1)
@@ -96,7 +96,7 @@ def read_file(ctx: RunContext[PermissionState], path: str, offset: int = 1, limi
                 region = f"第 {offset}～{end} 行" if lines else "空文件"
                 return f"文件未变化，{region}此前已读取；如需再次显示请设置 force=True"
             record.record(offset, end)
-            ctx.deps.files.read_file_state[key] = record
+            files.read_file_state[key] = record
             if not lines:
                 return "(空文件)"
             text = "\n".join(f"{number:>4} | {lines[number - 1]}" for number in range(offset, end + 1))
@@ -105,11 +105,17 @@ def read_file(ctx: RunContext[PermissionState], path: str, offset: int = 1, limi
     except FileNotFoundError:
         if key is not None:
             # 模型已通过真实读取获知文件不存在，清除过期的已读记录。
-            with ctx.deps.files.lock:
-                ctx.deps.files.read_file_state.pop(key, None)
+            with files.lock:
+                files.read_file_state.pop(key, None)
         return f"[错误] 文件 {path} 不存在"
     except (OSError, UnicodeError, ValueError) as error:
         return f"[错误] 无法读取 {path}：{error}"
+
+
+def read_file(ctx: RunContext[PermissionState], path: str, offset: int = 1, limit: int = 200, force: bool = False) -> str:
+    """读取 UTF-8 文件并显示行号；offset 从 1 开始，limit 为行数。重复读取可用 force 强制显示。"""
+    # SDK 调用入口只负责取得会话依赖，避免 @引用复制一套读取和版本检查逻辑。
+    return read_file_content(ctx.deps.files, path, offset, limit, force)
 
 
 def write_file(ctx: RunContext[PermissionState], path: str, content: str) -> str:

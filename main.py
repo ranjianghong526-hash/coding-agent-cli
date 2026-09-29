@@ -14,7 +14,9 @@ from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 
 # prompt_toolkit 负责输入体验，模型判断与工具执行不由它处理。
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import ThreadedCompleter
 from prompt_toolkit.key_binding import KeyBindings
+from file_mentions import FileMentionCompleter, prepare_file_messages
 
 # 导入 agent 包时会执行 agent/__init__.py，并进一步执行 core.py 的模型配置。
 # 因此 API_KEY 校验发生在进入 main() 之前。
@@ -31,6 +33,8 @@ from ui.commands import (
 
 # PromptSession 比内置 input() 好用：支持左右移动光标编辑，还会记住本次运行的输入历史，上下方向键可以翻
 prompt_session = PromptSession()
+# 文件扫描放到后台线程，输入中文和切换权限模式时不等待目录遍历。
+file_completer = ThreadedCompleter(FileMentionCompleter())
 
 
 def permission_key_bindings(state: SessionState) -> KeyBindings:
@@ -57,6 +61,7 @@ async def read_user_input(state: SessionState | None = None):
             "key_bindings": permission_key_bindings(state),
             "bottom_toolbar": lambda: f"权限：{state.permissions.mode}  |  Shift+Tab 切换模式",
         }
+        options.update(completer=file_completer, complete_while_typing=True)
         user_input = (await prompt_session.prompt_async("❯ ", **options)).strip()
     except (EOFError, KeyboardInterrupt):
         # 将 Ctrl-D / Ctrl-C 统一转换成 None，主循环据此退出。
@@ -129,23 +134,36 @@ async def run_agent(user_input: str, state: SessionState):
     iter() 返回异步上下文管理器；节点中的模型请求和工具操作仍由框架执行。
     此处展示完整响应片段，没有消费逐 token 的模型流。
     """
-    async with agent.iter(user_input, message_history=state.history, deps=state.permissions) as agent_run:
-        async for node in agent_run:
-            if Agent.is_model_request_node(node):
-                # 这个节点尚未执行，下一次迭代才发出模型请求。
-                console.print("[dim]✻ 正在请求模型…[/]")
-            elif Agent.is_call_tools_node(node):
-                # 模型响应已经返回，但工具尚未执行；先展示正文、思考和工具参数。
-                for part in node.model_response.parts:
+    completed = False
+    try:
+        injected = await asyncio.to_thread(prepare_file_messages, user_input, state.permissions.files)
+        # 新列表不提前改写 state.history：只有整轮成功后 apply_result 才提交历史。
+        history = state.history + injected
+        if injected:
+            for message in injected[1:]:
+                for part in message.parts:
                     print_part(part)
-                # 消费工具事件：每个工具返回时立即显示，不等全部工具或整轮结束。
-                # stream() 执行这个节点；后续迭代会使用已执行的结果，不重复跑工具。
-                async with node.stream(agent_run.ctx) as events:
-                    async for event in events:
-                        if isinstance(event, FunctionToolResultEvent):
-                            print_part(event.part)
-        # 最终结果与原同步执行一样提供完整历史和本轮用量。
-        return agent_run.result
+        # 引用分支已插入原始用户消息，传 None 避免 SDK 再追加一次同样的输入。
+        prompt = None if injected else user_input
+        async with agent.iter(prompt, message_history=history, deps=state.permissions) as agent_run:
+            async for node in agent_run:
+                if Agent.is_model_request_node(node):
+                    # 文件结果已经在 history 中，第一次请求就能看到，不需要模型再决定读取。
+                    console.print("[dim]✻ 正在请求模型…[/]")
+                elif Agent.is_call_tools_node(node):
+                    for part in node.model_response.parts:
+                        print_part(part)
+                    # 消费工具事件；后续迭代使用已执行结果，不重复跑工具。
+                    async with node.stream(agent_run.ctx) as events:
+                        async for event in events:
+                            if isinstance(event, FunctionToolResultEvent):
+                                print_part(event.part)
+            completed = True
+            return agent_run.result
+    finally:
+        if not completed:
+            # 失败轮次不进入历史，不能保留“模型已看过”的登记；磁盘操作不会撤销。
+            state.permissions.files.clear()
 
 
 def print_run_error(error: Exception) -> None:

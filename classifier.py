@@ -12,8 +12,8 @@ from typing import Any
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from pydantic_ai.messages import ModelMessage
-from context_injection import is_system_reminder
-from ui.questions import QuestionResult, USER_ANSWER_METADATA
+from context_injection import is_system_reminder, is_compact_summary
+from ui.questions import QuestionAnswer, QuestionResult, USER_ANSWER_METADATA
 
 _client: AsyncOpenAI | None = None
 CLASSIFIER_MODEL = ""
@@ -55,6 +55,44 @@ def configure_classifier(client: AsyncOpenAI, model_name: str) -> None:
     CLASSIFIER_MODEL = model_name
 
 
+def compact_authorizations(message: ModelMessage) -> list[dict]:
+    """仅读取程序在压缩前保存的原话元数据，不从摘要正文猜测授权。"""
+    records = (message.metadata or {}).get("compact_authorization", [])
+    if not isinstance(records, list):
+        raise ValueError("压缩授权记录损坏")
+    validated = []
+    for record in records:
+        if isinstance(record, dict) and set(record) == {"user"} and isinstance(record["user"], str):
+            validated.append(record)
+        elif isinstance(record, dict) and set(record) == {"user_answer"}:
+            validated.append({"user_answer": QuestionAnswer.model_validate(record["user_answer"]).model_dump()})
+        else:
+            raise ValueError("压缩授权记录格式错误")
+    return validated
+
+
+def collect_authorizations(messages: Sequence[ModelMessage]) -> list[dict]:
+    """原话/真人答案原样留给审批器；这些数据不作为正文发送给主模型。"""
+    records = []
+    for message in messages:
+        if is_compact_summary(message):
+            records.extend(compact_authorizations(message))
+            continue
+        if is_system_reminder(message):
+            continue
+        for part in message.parts:
+            if part.part_kind == "user-prompt":
+                if not isinstance(part.content, str):
+                    raise ValueError("无法完整保留非文本用户输入")
+                records.append({"user": part.content})
+            elif (part.part_kind == "tool-return" and part.tool_name == "ask_user_question"
+                  and part.metadata == USER_ANSWER_METADATA):
+                result = QuestionResult.model_validate(part.content)
+                if result.status == "answered":
+                    records.extend({"user_answer": answer.model_dump()} for answer in result.answers)
+    return records
+
+
 def build_transcript(messages: Sequence[ModelMessage], tool_name: str, args: dict[str, Any]) -> str:
     """逐行 JSON 编码，末行固定为待审查调用；保留完整参数，不修改执行参数。"""
     if tool_name in ("user", "user_answer"):
@@ -62,6 +100,11 @@ def build_transcript(messages: Sequence[ModelMessage], tool_name: str, args: dic
     lines = []
     has_user = False
     for message in messages:
+        if is_compact_summary(message):
+            records = compact_authorizations(message)
+            lines.extend(json.dumps(record, ensure_ascii=False) for record in records)
+            has_user = has_user or any("user" in record for record in records)
+            continue
         if is_system_reminder(message):
             # 提醒虽走 user 通道，却由程序生成，不能当作用户亲口授权。
             continue

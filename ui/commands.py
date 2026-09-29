@@ -57,6 +57,8 @@ class SessionState:
     saved_messages: int = 0
     # 回退后把被撤销轮次的原话放回输入区，用户可编辑后重新提交。
     next_prompt: str = ""
+    # 自动压缩连续失败后停止；手动压缩仍可尝试，成功后归零。
+    compact_failures: int = 0
     # 权限属于当前程序运行，/new 和 /resume 不重置，也不从 JSONL 恢复授权。
     permissions: PermissionState = field(default_factory=PermissionState)
 
@@ -75,7 +77,8 @@ class Command:
     # handler 返回 False 表示主循环应当退出
     # Callable 描述函数类型；引号中的 SessionState 是类型名称的字符串写法。
     # /resume 需要异步等待选择，其他命令仍可直接返回 bool。
-    handler: Callable[["SessionState"], bool | Awaitable[bool]]
+    handler: Callable[..., bool | Awaitable[bool]]
+    takes_args: bool = False
 
 
 def print_divider() -> None:
@@ -220,6 +223,7 @@ def cmd_new(state: SessionState) -> bool:
     state.session_id = new_id
     state.saved_messages = 0
     state.next_prompt = ""
+    state.compact_failures = 0
     state.permissions.files.clear()
     console.print("已开启新会话\n")
     return True
@@ -232,6 +236,9 @@ def cmd_status(state: SessionState) -> bool:
     console.print(f"模型：           {state.model_name}")
     console.print(f"权限模式：       {state.permissions.mode}")
     console.print(f"历史消息条数：    {len(state.history)}")
+    from compact import context_tokens, compact_threshold
+    used, threshold = context_tokens(state.history), compact_threshold()
+    console.print(f"当前上下文估算：  {used:,} / {threshold:,} tokens（自动压缩水位）")
     console.print(f"累计输入 tokens：{state.input_tokens}")
     console.print(f"累计输出 tokens：{state.output_tokens}\n")
     return True
@@ -278,6 +285,7 @@ async def cmd_resume(state: SessionState) -> bool:
     state.output_tokens = selected.output_tokens
     state.last_api_calls.clear()
     state.next_prompt = ""
+    state.compact_failures = 0
     # 模型继续使用当前 core.py 配置；不因历史文件而偷偷切换模型。
     state.permissions.files.clear()
     console.print(f"已恢复会话 {selected.session_id}，共 {len(selected.history)} 条消息。\n")
@@ -308,6 +316,23 @@ def cmd_tasks(state: SessionState) -> bool:
         print_tasks(state)
     else:
         console.print("当前会话没有任务。\n")
+    return True
+
+
+async def cmd_compact(state: SessionState, args: str = "") -> bool:
+    """手动压缩，可附重点；失败保留当前历史和文件登记，不阻止继续输入。"""
+    from compact import run_compact, print_compact_result
+    if not state.history:
+        console.print("当前没有可压缩的对话。\n")
+        return True
+    console.print("正在压缩上下文…")
+    try:
+        result = await run_compact(state, args)
+    except Exception as error:
+        message = str(error) if isinstance(error, ValueError) else type(error).__name__
+        console.print(f"压缩未完成：{message}。当前历史保留。", style="yellow", markup=False)
+        return True
+    print_compact_result(result)
     return True
 
 
@@ -407,6 +432,7 @@ def cmd_api_detail(state: SessionState) -> bool:
 # 命令名 -> Command 对象；handler 只接收共享 state，统一用 bool 控制是否继续。
 # 添加命令时定义 cmd_* 函数并在此注册，main.py 的分发逻辑通常无需修改。
 COMMANDS = {
+    "compact": Command("compact", "压缩上下文，可附重点，例如 /compact 保留错误原文", cmd_compact, takes_args=True),
     "rewind": Command("rewind", "回退到某轮需求之前：对话、代码或两者", cmd_rewind),
     "memory": Command("memory", "查看项目长期记忆索引及存储目录", cmd_memory),
     "tasks": Command("tasks", "查看当前会话的任务清单", cmd_tasks),

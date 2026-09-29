@@ -23,6 +23,7 @@
 - 任务管理：四个任务工具维护多步计划，独立保存进度，请求前注入清单并在终端展示。
 - 长期记忆：项目级 Markdown 文件保存偏好和约定，索引常驻、正文按需读取，后台提炼并定期合并。
 - 回退检查点：`/rewind` 可回退对话、代码或两者，保留原会话并保护外部修改。
+- 上下文压缩：`/compact [补充要求]` 将历史归纳为摘要，保存原文档案并重新读取近期文件；接近配置的上下文上限时自动尝试。
 
 ## 长期记忆
 
@@ -99,6 +100,31 @@
 检查点和版本都被 `.sessions/` 的 Git 忽略规则覆盖，可重启后 `/resume` 再 `/rewind`。失败轮次也保留检查点，第一轮失败且还没有聊天 JSONL 时仍能找到该会话。功能启用前的旧消息没有备份，不能补造回退点。
 
 范围仅包括当前项目内通过 `write_file`/`edit_file` 修改的普通文件。`run_command`、编辑器、数据库、网络请求的副作用不自动撤销；项目外文件、`.git`、`.sessions`、`.memory`、虚拟环境、依赖及程序内部目录不参加回退。目录创建本身不回退。已落盘的长期记忆保留，撤销时使尚未完成的后台提炼失效。按单 CLI 进程使用，备份目前不自动清理；检查点记录绝对项目路径，移动项目后不直接恢复旧路径。
+
+## 上下文压缩
+
+输入 `/compact`，或 `/compact 重点保留数据库迁移约定`。程序发起独立的摘要模型请求，把旧历史归纳为目标、约束、修改、验证和下一步。摘要模型没有工具，不能操作文件。摘要成功且确实缩短历史后，程序在原会话日志中提交压缩记录，再替换内存历史；会话编号不变，失败保留原历史。
+
+原来下一次模型请求要携带全部聊天和工具结果；压缩后 `state.history` 变为“带来源标记的摘要消息 + 最近文件的真实读取调用和返回”。近期文件最多重新读取 5 个，总预算 30 KB，每个文件仍遵循 `read_file` 的分页限制。读取的是磁盘当前内容，摘要中的代码不能充当编辑前的读取记录。
+
+压缩前的完整记录先存档，目录示例：
+
+```text
+.sessions/
+├── session-A.jsonl                # 旧记录 + 压缩边界/摘要 + 后续聊天
+└── compact-history/
+    └── session-A-时间-编号.jsonl  # 压缩前原文档案
+```
+
+`list_sessions()` 使用 `SESSION_DIR.glob("*.jsonl")`，只扫描第一层。因此 A 压缩多次仍是一个会话候选，子目录里的存档不会成为重复候选。`/resume A` 从最新压缩记录重建“摘要 + 保留的文件消息 + 后续聊天”，不会把旧聊天全部重新发送。摘要包含存档路径，模型需要细节时可以调用 `read_file` 阅读它。
+
+JSONL 每行仍是程序保存的结构化记录，普通轮次的 `kind` 为 `turn`，压缩记录为 `compact`。一条 compact 同时保存边界编号和完整替换历史；提交采用临时文件写入、fsync 和原子替换，旧日志字节保持为前缀。写入失败保留原文件；提交期间取消会等待写入结果，若已经提交则同步内存，避免磁盘和内存属于不同上下文。旧版无 kind 的记录默认按 turn 读取，不需要迁移；旧版已创建的分支保留，不自动合并或删除。
+
+压缩保留任务清单、长期记忆、权限模式与累计用量，不修改项目代码。检查点记录压缩边界编号；旧检查点日志及存档保留，但当前 `/rewind` 菜单只允许选择本次压缩后的检查点，不能跨边界误用历史偏移。压缩后的 `/rewind` 仍遵循原设计，可创建回退分支。真正的用户原话和已确认的问题答案另存为消息元数据，供 auto 审批使用；模型生成的摘要不能冒充用户授权，也不会被后台记忆提炼当作用户原话。
+
+在 `.env` 按实际模型设置 `CONTEXT_WINDOW`，默认 131072。每轮开始前估算上下文，达到 `CONTEXT_WINDOW - 30000` 时尝试自动压缩；连续失败 3 次暂停自动尝试，手动 `/compact` 仍可使用，成功后清零失败次数。`/status` 显示估算值和触发线。这不是精确 tokenizer，也不保证一轮内部大量工具输出或巨大文件引用不会超过模型上限。
+
+摘要请求使用独立的 60 秒超时，实际已知用量计入累计统计；它不进入主 Agent 的 `/api-detail`。摘要会遗漏细节，原文存档用于按需找回。压缩测试使用模拟模型，未调用真实服务。
 
 ## 快速开始
 
@@ -261,7 +287,7 @@ task_get(task_id=2) → 查看下一项要求
 
 任务保存为 `.sessions/<session_id>.tasks.json`，聊天仍保存为同编号的 `.jsonl`。每次创建或更新，先写同目录临时文件、同步数据、原子替换，再更新内存；保存失败不返回成功状态。任务文件被现有 `.sessions/` 忽略规则覆盖，不进入 Git。
 
-每次模型请求前，`before_model_request` 从任务存储生成最新标题和状态清单，以带来源标记的 `<system-reminder>` 追加；完整描述通过 `task_get` 按需读取。清单与聊天历史独立，因此历史丢失或未来压缩后仍能提供当前进度；当前项目尚未实现上下文压缩。任务提醒不作为 auto 审批的用户授权，后续文件和命令工具仍经过权限检查。
+每次模型请求前，`before_model_request` 从任务存储生成最新标题和状态清单，以带来源标记的 `<system-reminder>` 追加；完整描述通过 `task_get` 按需读取。清单与聊天历史独立，压缩后会保留当前进度。任务提醒不作为 auto 审批的用户授权，后续文件和命令工具仍经过权限检查。
 
 任务创建或更新后立即打印清单，主输入前也显示；`/tasks` 可本地查看，无需请求模型。`/new` 切换到空清单，旧文件保留；`/resume` 恢复所选会话的任务，不重跑旧工具。若第一轮中途失败，只有任务文件、还没有完整聊天轮次，也可从 `/resume` 找回计划，此时聊天历史为空。
 
@@ -278,10 +304,11 @@ task_get(task_id=2) → 查看下一项要求
 | `/tasks` | 查看当前会话任务清单，不调用模型 |
 | `/memory` | 查看项目长期记忆索引及保存目录，不调用模型 |
 | `/rewind` | 选择检查点，回退对话、代码或两者，不调用模型 |
+| `/compact [补充要求]` | 独立调用摘要模型，存档原文并压缩上下文，保持会话编号 |
 | `/api-detail` | 显示最近一轮每次模型调用的请求与响应摘要 |
 | `/exit` | 退出程序 |
 
-这些命令在本地处理，不触发模型请求。输入阶段也可以使用 Ctrl-C 或 Ctrl-D 退出。
+这些命令在本地分流；其中 `/compact` 会发起摘要模型请求。输入阶段也可以使用 Ctrl-C 或 Ctrl-D 退出。
 
 ### 工具权限审批
 
@@ -386,6 +413,8 @@ coding-agent-cli/
 ├── memory_worker.py      # 独立后台提炼请求、串行队列与定期合并
 ├── rewind_store.py       # 每轮检查点、文件版本备份、冲突检查与代码恢复
 ├── rewind.py             # 对话分支、三种回退模式与运行状态同步
+├── compact.py            # 上下文估算、独立摘要、原文存档与近期文件恢复
+├── test_compact.py       # 同会话压缩、恢复/回退、授权来源与失败保护测试
 ├── permissions.py        # 四种权限模式、审批输入和本次运行的临时授权
 ├── classifier.py         # 对话转写、独立模型审查与严格裁决校验
 ├── file_state.py         # 文件版本、已读行区间与会话内线程锁
@@ -471,7 +500,7 @@ flowchart LR
 ### 离线验证
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit test_file_mentions test_context_injection test_user_questions test_task_management test_memory test_rewind
+.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit test_file_mentions test_context_injection test_user_questions test_task_management test_memory test_rewind test_compact
 ```
 
 测试使用模拟模型和 HTTP 传输，不访问真实 DeepSeek，不使用真实 API Key。覆盖逐步展示、限流恢复、鉴权失败、工具故障及重试耗尽、会话保留和中断等场景。

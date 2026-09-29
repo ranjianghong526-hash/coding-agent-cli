@@ -160,10 +160,11 @@ def read_file_content(files: FileContext, path: str, offset: int = 1, limit: int
                 record = ReadFileState(version, len(lines))
             end = min(len(lines), offset + limit - 1)
             if not force and record.contains(offset, end):
+                files.remember(key, record)
                 region = f"第 {offset}～{end} 行" if lines else "空文件"
                 return f"文件未变化，{region}此前已读取；如需再次显示请设置 force=True"
             record.record(offset, end)
-            files.read_file_state[key] = record
+            files.remember(key, record)
             if not lines:
                 return "(空文件)"
             text = "\n".join(f"{number:>4} | {lines[number - 1]}" for number in range(offset, end + 1))
@@ -206,7 +207,7 @@ def write_file(ctx: RunContext[PermissionState], path: str, content: str) -> str
             count = len(content.splitlines())
             record = ReadFileState(version, count)
             record.record(1, count)
-            ctx.deps.files.read_file_state[key] = record
+            ctx.deps.files.remember(key, record)
             return f"已写入 {path}"
     except (OSError, UnicodeError, ValueError) as error:
         return f"[错误] 无法写入 {path}：{error}"
@@ -246,7 +247,7 @@ def edit_file(ctx: RunContext[PermissionState], path: str, old_string: str, new_
             record = ReadFileState(changed, len(updated.splitlines()))
             if ctx.deps.files.read_file_state[key].fully_read:
                 record.record(1, record.total_lines)
-            ctx.deps.files.read_file_state[key] = record
+            ctx.deps.files.remember(key, record)
             return f"已编辑 {path}：完成 1 处替换"
     except (OSError, UnicodeError, ValueError) as error:
         return f"[错误] 无法编辑 {path}：{error}"

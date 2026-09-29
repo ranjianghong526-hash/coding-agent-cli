@@ -14,7 +14,7 @@ from prompt_toolkit.input import DummyInput
 from prompt_toolkit.output import DummyOutput
 from pydantic_ai import Agent, models
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
-from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.deepseek import DeepSeekProvider
@@ -115,14 +115,17 @@ class AgentErrorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(executions), 3)
 
     async def test_main_continues_after_failure_and_keeps_previous_history(self):
-        state = SessionState(history=["previous history"], input_tokens=7)
+        previous_history = [ModelRequest(parts=[UserPromptPart("previous history")])]
+        next_history = previous_history + [ModelResponse(parts=[TextPart("next successful history")])]
+        state = SessionState(history=previous_history, input_tokens=7)
         error = ModelHTTPError(status_code=401, model_name="test", body="sensitive-detail")
         result = Mock()
-        result.all_messages.return_value = ["next successful history"]
+        result.all_messages.return_value = next_history
+        result.new_messages.return_value = []  # 本测试只验证错误恢复，不发起后台记忆请求。
         result.usage = SimpleNamespace(input_tokens=2, output_tokens=3)
 
         async def execute(user_input, current_state):
-            self.assertEqual(current_state.history, ["previous history"])
+            self.assertEqual(current_state.history, previous_history)
             if user_input == "fail":
                 # 模拟本轮已有一次成功模型调用、下一次请求失败。
                 api_call_log.append(ApiCall("test", 1, None, [], input_tokens=10, output_tokens=5))
@@ -138,7 +141,7 @@ class AgentErrorTests(unittest.IsolatedAsyncioTestCase):
                         with patch.object(commands, "console", Mock()), patch.object(main, "save_session"):
                             await main.main()
         self.assertEqual(run.await_count, 2)
-        self.assertEqual(state.history, ["next successful history"])
+        self.assertEqual(state.history, next_history)
         self.assertEqual(state.input_tokens, 19)
         shown = str(console.print.call_args_list)
         self.assertIn("API Key", shown)

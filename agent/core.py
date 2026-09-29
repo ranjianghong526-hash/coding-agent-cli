@@ -23,6 +23,7 @@ from permissions import PermissionState
 from classifier import configure_classifier
 from context_injection import build_project_context
 from memory_worker import configure_memory
+from compact import configure_compact
 
 # 固定读取项目根目录的 .env，保留已设置的系统环境变量。
 # __file__ 是当前文件路径；两次 parent 从 agent/core.py 回到项目根目录。
@@ -56,6 +57,10 @@ model = OpenAIChatModel(
     MODEL_NAME,
     provider=DeepSeekProvider(openai_client=client),
 )
+configure_compact(OpenAIChatModel(
+    MODEL_NAME,
+    provider=DeepSeekProvider(openai_client=client.with_options(timeout=60.0, max_retries=0)),
+))
 
 # 同一个 Agent 实例可以执行多轮任务；对话历史由 main.py 显式传入。
 agent = Agent(

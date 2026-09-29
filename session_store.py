@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import AwareDatetime, BaseModel, Field
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
@@ -23,6 +23,8 @@ SESSION_DIR = Path(__file__).resolve().parent / ".sessions"
 class StoredTurn(BaseModel):
     """一行就是一轮完整记录；消息和统计一起落盘，避免只保存半轮消息。"""
     version: Literal[1] = 1
+    # compact 是同一会话中的上下文替换记录；缺省 turn 兼容旧 JSONL。
+    kind: Literal["turn", "compact"] = "turn"
     model_name: str
     saved_at: AwareDatetime
     input_tokens: int = Field(ge=0, strict=True)
@@ -58,10 +60,43 @@ def _read_turns(path: Path) -> tuple[list[StoredTurn], int]:
             break
         turn = StoredTurn.model_validate_json(line)
         # 元数据与消息结构都合法才算完整记录，不能把损坏内容静默传给模型。
-        ModelMessagesTypeAdapter.validate_python(turn.messages)
+        messages = ModelMessagesTypeAdapter.validate_python(turn.messages)
+        if turn.kind == "compact":
+            from context_injection import is_compact_summary
+            if not messages or not is_compact_summary(messages[0]):
+                raise ValueError("压缩记录缺少带来源标记的摘要")
+            compact_id = messages[0].metadata.get("compact_id", "")
+            if not isinstance(compact_id, str) or not compact_id or UUID(compact_id).hex != compact_id:
+                raise ValueError("压缩记录缺少有效边界编号")
         turns.append(turn)
         valid_bytes += len(line)
     return turns, valid_bytes
+
+
+def _active_messages(turns: list[StoredTurn]) -> list[dict]:
+    """磁盘保留所有轮次，当前模型历史从最后一个压缩边界重新开始。"""
+    messages = []
+    for turn in turns:
+        if turn.kind == "compact":
+            messages = []
+        messages.extend(turn.messages)
+    return messages
+
+
+def history_context_id(history: list[ModelMessage]) -> str:
+    """检查点的位置属于某一段有效历史，不能跨压缩边界使用旧偏移。"""
+    from context_injection import is_compact_summary
+    if history and is_compact_summary(history[0]):
+        return history[0].metadata.get("compact_id", "")
+    return ""
+
+
+def session_context_id(session_id: str) -> str:
+    path = _session_path(session_id)
+    if not path.exists():
+        return ""
+    turns, _ = _read_turns(path)
+    return history_context_id(ModelMessagesTypeAdapter.validate_python(_active_messages(turns)))
 
 
 def save_session(state: "SessionState") -> None:
@@ -75,7 +110,7 @@ def save_session(state: "SessionState") -> None:
     saved_count = 0
     if path.exists():
         turns, valid_bytes = _read_turns(path)
-        saved = [message for turn in turns for message in turn.messages]
+        saved = _active_messages(turns)
         saved_count = len(saved)
         if saved != history[:saved_count] or saved_count > len(history):
             raise ValueError("磁盘会话与当前历史不一致，请用 /resume 重新选择会话")
@@ -100,11 +135,30 @@ def save_session(state: "SessionState") -> None:
     state.saved_messages = len(state.history)
 
 
+def save_compacted_history(state: "SessionState", history: list[ModelMessage]) -> None:
+    """原日志后追加一条完整压缩记录；单文件原子替换避免边界与摘要只保存一半。"""
+    from context_injection import is_compact_summary
+    from rewind_store import _atomic_save
+    if not history or not is_compact_summary(history[0]) or not history_context_id(history):
+        raise ValueError("压缩历史缺少摘要或边界编号")
+    path = _session_path(state.session_id)
+    turns, valid_bytes = _read_turns(path)
+    original = ModelMessagesTypeAdapter.dump_python(state.history, mode="json")
+    if _active_messages(turns) != original:
+        raise ValueError("磁盘会话与压缩前历史不一致，请重新恢复会话")
+    turn = StoredTurn(kind="compact", model_name=state.model_name,
+                      saved_at=datetime.now(timezone.utc), input_tokens=state.input_tokens,
+                      output_tokens=state.output_tokens,
+                      messages=ModelMessagesTypeAdapter.dump_python(history, mode="json"))
+    # 写临时文件、fsync、replace；失败时旧文件仍完整，成功后保留原日志字节前缀。
+    _atomic_save(path, path.read_bytes()[:valid_bytes] + (turn.model_dump_json() + "\n").encode("utf-8"))
+
+
 def load_session(session_id: str) -> SavedSession:
     """恢复完整消息对象和累计统计，不调用模型，也不重新执行历史中的工具。"""
     from task_store import TaskDocument, TaskStore
     from rewind_store import RewindDocument, RewindStore
-    from context_injection import is_system_reminder
+    from context_injection import is_system_reminder, is_compact_summary
 
     path = _session_path(session_id)
     task_path = TaskStore.path(session_id)
@@ -124,10 +178,18 @@ def load_session(session_id: str) -> SavedSession:
             updated = datetime.fromtimestamp(rewind_path.stat().st_mtime, timezone.utc)
             return SavedSession(session_id, [], 0, 0, updated, title)
         raise ValueError("会话没有完整记录")
-    history = ModelMessagesTypeAdapter.validate_python([m for turn in turns for m in turn.messages])
+    history = ModelMessagesTypeAdapter.validate_python(_active_messages(turns))
+    # 标题沿用原会话第一条真实用户输入，不因摘要或下一轮问题而改变。
+    title_history = ModelMessagesTypeAdapter.validate_python([m for turn in turns for m in turn.messages])
     title = rewind.checkpoints[0].prompt[:60] if rewind is not None and rewind.checkpoints else "未命名会话"
     found = False
-    for message in history:
+    for message in title_history:
+        if is_compact_summary(message):
+            from classifier import compact_authorizations
+            users = [record["user"] for record in compact_authorizations(message) if "user" in record]
+            if users and not found:
+                title = "压缩：" + " ".join(users[0].split())[:55]
+            continue
         if is_system_reminder(message):
             continue
         for part in message.parts:
@@ -159,3 +221,19 @@ def list_sessions() -> tuple[list[SavedSession], list[str]]:
             unreadable.append(f"{session_id}（{type(error).__name__}）")
     sessions.sort(key=lambda session: session.updated_at, reverse=True)
     return sessions, unreadable
+
+
+def archive_session(state: "SessionState") -> Path:
+    """先补存完整历史，再保留原始 JSONL 和侧车日志；名字唯一，存档不进入 /resume 扫描。"""
+    from rewind_store import _atomic_save
+    save_session(state)
+    source = _session_path(state.session_id)
+    path = SESSION_DIR / "compact-history" / (
+        f"{state.session_id}-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{uuid4().hex}.jsonl"
+    )
+    _atomic_save(path, source.read_bytes())
+    for suffix in (".tasks.json", ".rewind.json"):
+        sidecar = source.with_suffix(suffix)
+        if sidecar.exists():
+            _atomic_save(path.with_suffix(suffix), sidecar.read_bytes())
+    return path

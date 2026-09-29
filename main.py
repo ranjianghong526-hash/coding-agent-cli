@@ -9,6 +9,7 @@ from inspect import isawaitable
 
 from session_store import save_session
 from memory_worker import MemoryWorker
+from compact import auto_compact_if_needed
 
 from pydantic_ai import Agent, FunctionToolResultEvent
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
@@ -89,8 +90,8 @@ async def handle_command(user_input, state):
     if not user_input.startswith("/"):
         # 普通自然语言需求继续走 Agent 分支。
         return "pass"
-    # 去掉开头的 /，只取第一个词作为命令名；当前命令不解析额外参数。
-    words = user_input[1:].split()
+    # 只拆命令名和剩余整段文本，/compact 的补充要求不会被拆成多个词。
+    words = user_input[1:].split(maxsplit=1)
     if not words:
         console.print("请输入命令名，例如 /help\n")
         return "continue"
@@ -101,7 +102,7 @@ async def handle_command(user_input, state):
         console.print(f"未知命令：/{cmd_name}，输入 /help 查看可用命令\n")
         return "continue"
     # handler 的 bool 返回值是统一约定：True 继续接收输入，False 退出。
-    result = command.handler(state)
+    result = command.handler(state, words[1].strip() if len(words) > 1 else "") if command.takes_args else command.handler(state)
     if isawaitable(result):
         # 只有异步命令需要 await；原有同步命令沿用原来的返回约定。
         result = await result
@@ -144,6 +145,8 @@ async def run_agent(user_input: str, state: SessionState):
     """
     completed = False
     try:
+        # 在创建检查点之前替换历史，新检查点才能记录压缩后的消息下标。
+        await auto_compact_if_needed(state, user_input)
         state.permissions.tasks.bind(state.session_id)
         state.permissions.rewind.bind(state.session_id)
         # 在预读文件及模型/工具执行之前记录本轮起点，失败轮次也可恢复文件。

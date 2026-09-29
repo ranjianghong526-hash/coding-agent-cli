@@ -25,6 +25,8 @@ class Checkpoint(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex, pattern=r"^[a-f0-9]{32}$")
     prompt: str
     history_count: int = Field(ge=0, strict=True)
+    # 空串是尚未压缩的旧会话；有编号时只对对应压缩后的历史有效。
+    context_id: str = Field(default="", pattern=r"^(|[a-f0-9]{32})$")
     tasks: TaskDocument = Field(default_factory=TaskDocument)
     selectable: bool = True
     edits: list[FileEdit] = Field(default_factory=list)
@@ -60,6 +62,7 @@ class RewindStore:
         self.session_id = uuid4().hex
         self.document = RewindDocument(root=str(self.root))
         self.active_id: str | None = None
+        self.context_id = ""
         self.lock = RLock()
 
     @staticmethod
@@ -78,7 +81,10 @@ class RewindStore:
             for checkpoint in document.checkpoints:
                 for edit in checkpoint.edits:
                     self._checked_path(edit.path)
+            from session_store import session_context_id
+            context_id = session_context_id(session_id)
             self.session_id, self.document, self.active_id = session_id, document, None
+            self.context_id = context_id
 
     def _checked_path(self, value: str) -> Path:
         path = Path(value)
@@ -103,7 +109,8 @@ class RewindStore:
 
     def begin(self, prompt: str, history_count: int, tasks: TaskDocument) -> str:
         with self.lock:
-            checkpoint = Checkpoint(prompt=prompt, history_count=history_count, tasks=tasks.model_copy(deep=True))
+            checkpoint = Checkpoint(prompt=prompt, history_count=history_count, context_id=self.context_id,
+                                    tasks=tasks.model_copy(deep=True))
             document = self.document.model_copy(deep=True)
             document.checkpoints.append(checkpoint)
             self._commit(document)
@@ -145,7 +152,7 @@ class RewindStore:
 
     def choices(self, history_count: int) -> list[Checkpoint]:
         return [point.model_copy(deep=True) for point in self.document.checkpoints
-                if point.selectable and point.history_count <= history_count]
+                if point.selectable and point.context_id == self.context_id and point.history_count <= history_count]
 
     def fork(self, session_id: str, checkpoint_id: str) -> "RewindStore":
         """保留旧日志；分支中被撤销的消息不可再选，但其文件版本仍可供更早的回退使用。"""
@@ -160,6 +167,7 @@ class RewindStore:
         if not selected:
             raise ValueError("检查点不存在")
         new._commit(document)
+        new.context_id = self.context_id
         return new
 
     def plan(self, checkpoint_id: str) -> list[tuple[Path, bytes | None, int | None, bytes | None, int | None]]:
@@ -206,7 +214,8 @@ class RewindStore:
             if not plan:
                 return 0
             before = self.document.model_copy(deep=True)
-            restore = Checkpoint(prompt="程序执行代码回退", history_count=history_count, selectable=False)
+            restore = Checkpoint(prompt="程序执行代码回退", history_count=history_count,
+                                 context_id=self.context_id, selectable=False)
             for path, target, _, current, mode in plan:
                 restore.edits.append(FileEdit(path=str(path), before=self._backup(current), after=self._backup(target), before_mode=mode))
             document = before.model_copy(deep=True)

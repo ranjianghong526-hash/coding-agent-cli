@@ -5,7 +5,7 @@ import json
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai.messages import ToolReturnPart, UserPromptPart
 
-from context_injection import is_system_reminder
+from context_injection import is_system_reminder, is_compact_summary
 from memory_store import Memory, MemoryStore
 
 _client = None
@@ -56,7 +56,7 @@ async def _request(instruction: str, payload: dict, schema):
 
 def user_statements(messages) -> list[str]:
     """只提炼真正用户消息：工具正文、模型猜测、程序提醒不能冒充用户偏好。"""
-    return [part.content for message in messages if not is_system_reminder(message)
+    return [part.content for message in messages if not is_system_reminder(message) and not is_compact_summary(message)
             for part in message.parts if isinstance(part, UserPromptPart) and isinstance(part.content, str)]
 
 

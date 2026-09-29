@@ -122,3 +122,8 @@ def make_system_reminder(text: str) -> ModelRequest:
 def is_system_reminder(message: ModelMessage) -> bool:
     """检查程序元数据，不凭正文中的标签判断，用户自己输入标签仍是用户原话。"""
     return isinstance(message, ModelRequest) and (message.metadata or {}).get("context_injection") == REMINDER_SOURCE
+
+
+def is_compact_summary(message: ModelMessage) -> bool:
+    """摘要使用 user 通道，但内容由模型生成；仅凭正文标签不能伪造来源。"""
+    return isinstance(message, ModelRequest) and (message.metadata or {}).get("context_injection") == "compact-summary"

@@ -46,6 +46,16 @@ class FileContext:
     read_file_state: dict[str, ReadFileState] = field(default_factory=dict)
     lock: Any = field(default_factory=RLock, repr=False)
 
+    def remember(self, path: str, record: ReadFileState) -> None:
+        """按最近实际读取/写入顺序排列，重复读老文件也刷新顺序。"""
+        with self.lock:
+            self.read_file_state.pop(path, None)
+            self.read_file_state[path] = record
+
+    def paths(self) -> list[str]:
+        with self.lock:
+            return list(self.read_file_state)
+
     def clear(self) -> None:
         """新建或恢复会话必须重新读磁盘，不能用历史消息冒充当前文件快照。"""
         with self.lock:

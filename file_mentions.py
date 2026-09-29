@@ -93,6 +93,13 @@ def prepare_file_messages(text: str, files: FileContext) -> list:
     paths = extract_mentions(text)
     if not paths:
         return []
+    return [ModelRequest([UserPromptPart(text)]), *build_file_messages(paths, files)]
+
+
+def build_file_messages(paths: list[str], files: FileContext) -> list:
+    """引用和压缩共用：执行真实读取，构造 ID 配对的工具调用/结果，不添加用户原话。"""
+    if not paths:
+        return []
     # 延迟导入：单独使用补全/解析功能不需要初始化 Agent 或配置 API Key。
     from agent.tools import read_file_content
 
@@ -106,4 +113,4 @@ def prepare_file_messages(text: str, files: FileContext) -> list:
         returns.append(ToolReturnPart("read_file", content, tool_call_id=call_id))
     # 文件内容属于 tool-return，不能拼进 user-prompt 冒充用户授权。
     # 两边相同的 tool_call_id 用于将每个调用与它的结果配对。
-    return [ModelRequest([UserPromptPart(text)]), ModelResponse(calls), ModelRequest(returns)]
+    return [ModelResponse(calls), ModelRequest(returns)]

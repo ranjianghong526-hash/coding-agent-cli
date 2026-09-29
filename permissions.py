@@ -38,7 +38,8 @@ def requires_approval(mode: PermissionMode, tool_name: str) -> bool:
     """只读工具明确列入白名单，未知工具默认需要审批。"""
     if mode not in MODES:
         raise ValueError("未知权限模式")
-    if mode == "bypass" or tool_name == "read_file":
+    # 提问不执行文件/命令操作，不需要先审批“是否允许问问题”。
+    if mode == "bypass" or tool_name in ("read_file", "ask_user_question"):
         return False
     return not (mode == "acceptEdits" and tool_name in ("write_file", "edit_file"))
 

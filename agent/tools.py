@@ -11,11 +11,28 @@ import stat
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Annotated
 
+from pydantic import Field
 from pydantic_ai import RunContext, Tool
+from pydantic_ai.messages import ToolReturn
 
 from file_state import FileContext, FileVersion, ReadFileState
 from permissions import PermissionState
+from ui.questions import Question, USER_ANSWER_METADATA, ask_questions
+
+
+async def ask_user_question(
+    ctx: RunContext[PermissionState],
+    questions: Annotated[list[Question], Field(min_length=1, max_length=4)],
+) -> ToolReturn:
+    """向用户澄清关键需求；一次 1～4 题，每题可单选、多选或自由输入。返回用户确认的答案；取消时不得推断答案或绕过取消。"""
+    # 与人工权限审批共享终端锁；审批 hook 结束后才进入这里，避免嵌套加锁。
+    # await 会暂停这个工具，直到真人提交；它不会阻塞整个 asyncio 事件循环。
+    async with ctx.deps.approval_lock:
+        result = await ask_questions(questions)
+    # SDK 把 return_value 写成 ToolReturnPart；metadata 只供程序识别回答来源。
+    return ToolReturn(return_value=result.model_dump(), metadata=dict(USER_ANSWER_METADATA))
 
 
 def _path(path: str) -> tuple[Path, str]:
@@ -210,6 +227,7 @@ def run_command(command: str) -> str:
 # JSON Schema 是工具参数的结构说明：模型据此知道有哪些参数及其类型。
 # 工具 docstring 也会参与模型看到的说明，因此教学细节主要放在 # 注释里。
 TOOLS = [
+    Tool(ask_user_question, sequential=True),
     Tool(read_file, sequential=True),
     Tool(write_file, sequential=True),
     Tool(edit_file, sequential=True),

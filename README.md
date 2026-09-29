@@ -22,6 +22,7 @@
 - 主动提问：模型可批量澄清需求，终端支持单选、多选、自定义回答和取消。
 - 任务管理：四个任务工具维护多步计划，独立保存进度，请求前注入清单并在终端展示。
 - 长期记忆：项目级 Markdown 文件保存偏好和约定，索引常驻、正文按需读取，后台提炼并定期合并。
+- 回退检查点：`/rewind` 可回退对话、代码或两者，保留原会话并保护外部修改。
 
 ## 长期记忆
 
@@ -62,6 +63,42 @@
 落盘前检查审阅时的完整快照，用户或工具改过文件就拒绝旧裁决。显式保存/忘记会让旧后台任务失效，避免被旧偏好写回；本轮拒绝记忆工具时，后台也跳过提炼。单次多条提炼不是整体事务：后续写入故障时，之前成功保存的条目仍可能保留。按单 CLI 进程使用，不支持多个进程同时改同一记忆库。
 
 记忆只作为背景，当前需求优先，不能恢复过去的工具授权；auto 分类器也不把记忆正文当成用户授权。保存敏感信息的禁止要求由模型提示约束，并非秘密识别器，使用 `/memory` 和编辑器检查实际保存内容。每项目最多 32 条，每条正文最多 6000 字符；不引入向量库。`.memory/` 已被 Git 和文件补全清单排除。
+
+## 回退对话和代码
+
+输入 `/rewind`，选择一条用户需求，然后选择模式；恢复到的是**这条需求开始之前**，包括撤销该轮及后续轮次。编号列表展示各轮原话和登记文件数量，模式选择前展示涉及的文件路径。回车、`q`、Esc、Ctrl-C/Ctrl-D 可以取消。
+
+| 模式 | 聊天历史 | 文件 |
+|---|---|---|
+| 1：仅对话 | 截断到检查点，保存到新会话分支 | 保留当前代码；追加程序提醒，避免使用旧工具结果 |
+| 2：仅代码 | 保留当前对话，追加重新读取文件的提醒 | 恢复修改前字节，删除选中轮次之后由文件工具新建的文件 |
+| 3：对话和代码 | 截断并另开分支 | 同时恢复文件 |
+
+例：初始 `app.py` 端口 8000，第一轮改成 8080，第二轮改成 9000 并新建 `config.py`。选第二轮、模式 3 后，端口回到 8080，`config.py` 被删除，聊天只保留第一轮；第二轮原话回到输入区，可以编辑后重新提交。原会话可用 `/resume` 找回，但恢复聊天不会重新应用它当时的代码。
+
+实现使用文件备份，不创建 Git commit 或改变分支。每轮在模型和预读运行前建立检查点，记录用户输入、`history_count` 和任务快照。`write_file`/`edit_file` 完成权限/已读/版本校验后，先保存修改前与预计修改后的文件字节、登记版本，再真正修改文件；备份失败则不修改代码。同一文件多次修改均登记，恢复时使用所选检查点后第一次修改之前的版本。
+
+文件存储：
+
+```text
+.sessions/
+├── <session_id>.jsonl        # 完整聊天轮次
+├── <session_id>.tasks.json   # 当前任务状态
+├── <session_id>.rewind.json  # 各轮检查点、文件路径及版本编号
+└── versions/
+    ├── <SHA256版本编号>      # 修改前/后的完整原始字节
+    └── ...
+```
+
+`versions` 用真实内容哈希命名，相同内容复用备份。空文件有自己的哈希；`before=null` 表示原来不存在，恢复时删除新文件，不能与空文件混为一谈。二进制字节备份保留 UTF-8 BOM、CRLF 等，不按显示过的行号重新构造正文。
+
+恢复前先检查所有涉及的文件：磁盘内容必须匹配最后一次登记操作的修改前或修改后版本，备份哈希必须正确，路径必须仍在当前项目且不含符号链接跳转。发现编辑器/命令造成的不同内容，整次停止，不强行覆盖。恢复执行期间再次核对版本。普通 I/O 故障会尝试撤销已恢复的文件；若补偿也失败，提示部分恢复并保留日志/备份，不能误报成功。多个文件的恢复不是文件系统级事务，强制终止进程可能留下部分恢复。
+
+对话回退先保存原会话，再创建新的 UUID 分支，保存保留的完整 SDK 消息及检查点任务快照；任务状态随对话一起回退，文件模式不改任务。历史按轮次起点截断，保留消息配对，不重放旧工具。临时文件已读状态和记住的工具许可清空；权限模式保留。已实际消耗的 token 计数保留，不因撤销消息而归零。
+
+检查点和版本都被 `.sessions/` 的 Git 忽略规则覆盖，可重启后 `/resume` 再 `/rewind`。失败轮次也保留检查点，第一轮失败且还没有聊天 JSONL 时仍能找到该会话。功能启用前的旧消息没有备份，不能补造回退点。
+
+范围仅包括当前项目内通过 `write_file`/`edit_file` 修改的普通文件。`run_command`、编辑器、数据库、网络请求的副作用不自动撤销；项目外文件、`.git`、`.sessions`、`.memory`、虚拟环境、依赖及程序内部目录不参加回退。目录创建本身不回退。已落盘的长期记忆保留，撤销时使尚未完成的后台提炼失效。按单 CLI 进程使用，备份目前不自动清理；检查点记录绝对项目路径，移动项目后不直接恢复旧路径。
 
 ## 快速开始
 
@@ -240,6 +277,7 @@ task_get(task_id=2) → 查看下一项要求
 | `/status` | 显示会话编号、模型、权限模式、历史消息数量和累计 token 用量 |
 | `/tasks` | 查看当前会话任务清单，不调用模型 |
 | `/memory` | 查看项目长期记忆索引及保存目录，不调用模型 |
+| `/rewind` | 选择检查点，回退对话、代码或两者，不调用模型 |
 | `/api-detail` | 显示最近一轮每次模型调用的请求与响应摘要 |
 | `/exit` | 退出程序 |
 
@@ -346,6 +384,8 @@ coding-agent-cli/
 ├── task_store.py         # 独立任务状态、原子保存、会话切换与任务提醒
 ├── memory_store.py       # Markdown 记忆、索引、版本保护与合并备份
 ├── memory_worker.py      # 独立后台提炼请求、串行队列与定期合并
+├── rewind_store.py       # 每轮检查点、文件版本备份、冲突检查与代码恢复
+├── rewind.py             # 对话分支、三种回退模式与运行状态同步
 ├── permissions.py        # 四种权限模式、审批输入和本次运行的临时授权
 ├── classifier.py         # 对话转写、独立模型审查与严格裁决校验
 ├── file_state.py         # 文件版本、已读行区间与会话内线程锁
@@ -370,6 +410,7 @@ coding-agent-cli/
 ├── test_file_mentions.py # @补全、首次请求带内容、编辑与持久化测试
 ├── test_context_injection.py # 动态约定、外部修改、提醒来源与恢复测试
 ├── test_memory.py        # 重启召回、真实 SDK、后台提炼、冲突与合并测试
+├── test_rewind.py        # 检查点、三种模式、失败轮次及恢复冲突测试
 ├── test_user_questions.py # 提问表单按键、SDK 等待回答、来源过滤与恢复测试
 ├── test_task_management.py # 任务持久化、失败恢复、会话隔离与请求提醒测试
 ├── requirements.txt      # Python 依赖
@@ -430,7 +471,7 @@ flowchart LR
 ### 离线验证
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit test_file_mentions test_context_injection test_user_questions test_task_management test_memory
+.\.venv\Scripts\python.exe -X utf8 -m unittest -v test_realtime_output test_error_handling test_session_store test_permissions test_auto_mode test_file_edit test_file_mentions test_context_injection test_user_questions test_task_management test_memory test_rewind
 ```
 
 测试使用模拟模型和 HTTP 传输，不访问真实 DeepSeek，不使用真实 API Key。覆盖逐步展示、限流恢复、鉴权失败、工具故障及重试耗尽、会话保留和中断等场景。

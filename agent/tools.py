@@ -191,6 +191,7 @@ def write_file(ctx: RunContext[PermissionState], path: str, content: str) -> str
         resolved, key = _path(path)
         with ctx.deps.files.lock:
             expected = None
+            old = None
             bom = b""
             if resolved.exists():
                 old, expected = _read_disk(resolved)
@@ -199,6 +200,8 @@ def write_file(ctx: RunContext[PermissionState], path: str, content: str) -> str
             elif key in ctx.deps.files.read_file_state:
                 raise ValueError("文件在上次读取后被删除，未重新创建；请先 read_file 确认当前状态")
             data = bom + content.encode("utf-8")
+            # 先写版本备份及日志，备份失败则不会修改真实文件。
+            ctx.deps.rewind.capture(resolved, old, data)
             version = _atomic_write(resolved, data, expected)
             count = len(content.splitlines())
             record = ReadFileState(version, count)
@@ -236,7 +239,9 @@ def edit_file(ctx: RunContext[PermissionState], path: str, old_string: str, new_
                 return "[错误] 匹配位置尚未读取，文件未修改；请 read_file 读取目标行后再编辑"
             updated = text[:first] + new + text[first + len(old):]
             bom = codecs.BOM_UTF8 if data.startswith(codecs.BOM_UTF8) else b""
-            changed = _atomic_write(resolved, bom + updated.encode("utf-8"), version)
+            new_data = bom + updated.encode("utf-8")
+            ctx.deps.rewind.capture(resolved, data, new_data)
+            changed = _atomic_write(resolved, new_data, version)
             # 模型只看到了局部内容时，编辑后也不能冒充完整读取。
             record = ReadFileState(changed, len(updated.splitlines()))
             if ctx.deps.files.read_file_state[key].fully_read:

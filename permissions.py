@@ -13,6 +13,7 @@ from classifier import classify
 from file_state import FileContext
 from task_store import TaskStore
 from memory_store import MemoryStore
+from rewind_store import RewindStore
 
 from ui.render import console
 
@@ -34,6 +35,8 @@ class PermissionState:
     tasks: TaskStore = field(default_factory=TaskStore)
     # 长期记忆按项目共享；切换/恢复会话不更换这个对象，不恢复执行授权。
     memory: MemoryStore = field(default_factory=MemoryStore)
+    # 每轮检查点和文件版本单独持久化，和当前聊天会话绑定。
+    rewind: RewindStore = field(default_factory=RewindStore)
 
     def cycle_mode(self) -> None:
         """Shift+Tab 按固定顺序切换模式，不影响正在编辑的需求。"""

@@ -81,6 +81,11 @@ class TaskStore:
         with self.lock:
             return [task.model_dump() for task in self.document.tasks]
 
+    def restore(self, document: TaskDocument) -> None:
+        """回退对话时恢复检查点的任务状态；写盘失败不发布新状态。"""
+        with self.lock:
+            self._commit(TaskDocument.model_validate(document.model_dump()))
+
     def get(self, task_id: int) -> dict:
         with self.lock:
             task = next((task for task in self.document.tasks if task.id == task_id), None)

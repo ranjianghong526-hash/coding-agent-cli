@@ -66,7 +66,11 @@ async def read_user_input(state: SessionState | None = None):
             "bottom_toolbar": lambda: f"权限：{state.permissions.mode}  |  Shift+Tab 切换模式",
         }
         options.update(completer=file_completer, complete_while_typing=True)
+        if state is not None and state.next_prompt:
+            options["default"] = state.next_prompt
         user_input = (await prompt_session.prompt_async("❯ ", **options)).strip()
+        if state is not None:
+            state.next_prompt = ""
     except (EOFError, KeyboardInterrupt):
         # 将 Ctrl-D / Ctrl-C 统一转换成 None，主循环据此退出。
         print()
@@ -141,6 +145,9 @@ async def run_agent(user_input: str, state: SessionState):
     completed = False
     try:
         state.permissions.tasks.bind(state.session_id)
+        state.permissions.rewind.bind(state.session_id)
+        # 在预读文件及模型/工具执行之前记录本轮起点，失败轮次也可恢复文件。
+        await asyncio.to_thread(state.permissions.rewind.begin, user_input, len(state.history), state.permissions.tasks.document)
         injected = await asyncio.to_thread(prepare_file_messages, user_input, state.permissions.files)
         # 新列表不提前改写 state.history：只有整轮成功后 apply_result 才提交历史。
         history = state.history + injected
@@ -168,6 +175,7 @@ async def run_agent(user_input: str, state: SessionState):
             completed = True
             return agent_run.result
     finally:
+        state.permissions.rewind.end()
         if not completed:
             # 失败轮次不进入历史，不能保留“模型已看过”的登记；磁盘操作不会撤销。
             state.permissions.files.clear()

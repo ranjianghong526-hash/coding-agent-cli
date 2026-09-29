@@ -55,12 +55,15 @@ class SessionState:
     # 每个新会话使用独立文件；saved_messages 标记已成功落盘的消息数量。
     session_id: str = field(default_factory=lambda: uuid4().hex)
     saved_messages: int = 0
+    # 回退后把被撤销轮次的原话放回输入区，用户可编辑后重新提交。
+    next_prompt: str = ""
     # 权限属于当前程序运行，/new 和 /resume 不重置，也不从 JSONL 恢复授权。
     permissions: PermissionState = field(default_factory=PermissionState)
 
     def __post_init__(self):
         # deps 中的任务存储与聊天会话使用相同编号，避免串到其他会话。
         self.permissions.tasks.bind(self.session_id)
+        self.permissions.rewind.bind(self.session_id)
 
 
 @dataclass
@@ -203,7 +206,12 @@ def cmd_new(state: SessionState) -> bool:
     # 切换前补存尚未写入的历史；失败则不清空状态，避免丢失可继续保存的内容。
     save_session(state)
     new_id = uuid4().hex
+    # 先校验检查点，再切换任务；避免损坏日志造成半次会话切换。
+    from rewind_store import RewindStore
+    new_rewind = RewindStore(state.permissions.rewind.root)
+    new_rewind.bind(new_id)
     state.permissions.tasks.bind(new_id)
+    state.permissions.rewind = new_rewind
     # 只切换当前会话，旧 JSONL 文件和工具写入的文件都保留。
     state.history.clear()
     state.input_tokens = 0
@@ -211,6 +219,7 @@ def cmd_new(state: SessionState) -> bool:
     state.last_api_calls.clear()
     state.session_id = new_id
     state.saved_messages = 0
+    state.next_prompt = ""
     state.permissions.files.clear()
     console.print("已开启新会话\n")
     return True
@@ -256,14 +265,19 @@ async def cmd_resume(state: SessionState) -> bool:
     save_session(state)
     # 列表展示之后当前会话可能刚补存过，重新加载才能拿到最新完整历史。
     selected = load_session(selected.session_id)
+    from rewind_store import RewindStore
+    new_rewind = RewindStore(state.permissions.rewind.root)
+    new_rewind.bind(selected.session_id)
     # 先校验并加载任务，再修改会话字段；坏任务文件不能导致半次切换。
     state.permissions.tasks.bind(selected.session_id)
+    state.permissions.rewind = new_rewind
     state.history = selected.history
     state.session_id = selected.session_id
     state.saved_messages = len(selected.history)
     state.input_tokens = selected.input_tokens
     state.output_tokens = selected.output_tokens
     state.last_api_calls.clear()
+    state.next_prompt = ""
     # 模型继续使用当前 core.py 配置；不因历史文件而偷偷切换模型。
     state.permissions.files.clear()
     console.print(f"已恢复会话 {selected.session_id}，共 {len(selected.history)} 条消息。\n")
@@ -294,6 +308,60 @@ def cmd_tasks(state: SessionState) -> bool:
         print_tasks(state)
     else:
         console.print("当前会话没有任务。\n")
+    return True
+
+
+async def cmd_rewind(state: SessionState) -> bool:
+    """选一轮的开始位置，再选择回退对话/代码/两者；空输入和中断不操作。"""
+    from rewind import apply_rewind
+    from prompt_toolkit.key_binding import KeyBindings
+
+    points = state.permissions.rewind.choices(len(state.history))
+    if not points:
+        console.print("当前会话没有检查点；旧会话在功能启用前的改动无法回退。\n")
+        return True
+    console.print("回退到以下用户需求开始之前（会撤销所选轮次及后续轮次）：")
+    for index, point in enumerate(points, 1):
+        names = {edit.path for edit in point.edits}
+        console.print(f"  {index}. {point.prompt[:160]}  [本轮登记 {len(names)} 个文件]", markup=False)
+    bindings = KeyBindings()
+
+    @bindings.add("escape")
+    def cancel(event):
+        event.app.exit(result="q")
+
+    session = PromptSession(key_bindings=bindings)
+    try:
+        choice = (await session.prompt_async("选择编号（回车或 q 取消）：")).strip()
+        if not choice or choice.lower() == "q":
+            return True
+        if not choice.isdecimal() or not 1 <= int(choice) <= len(points):
+            console.print("编号无效，未回退。\n")
+            return True
+        selected = points[int(choice) - 1]
+        checkpoints = state.permissions.rewind.document.checkpoints
+        start = next(i for i, point in enumerate(checkpoints) if point.id == selected.id)
+        paths = sorted({edit.path for point in checkpoints[start:] for edit in point.edits})
+        console.print("代码模式将检查并恢复以下文件：", markup=False)
+        for path in paths:
+            console.print(f"  {path}", markup=False)
+        console.print("1：仅对话（保留代码）；2：仅代码（保留对话）；3：对话和代码。")
+        mode = (await session.prompt_async("选择模式并执行（回车或 q 取消）：")).strip()
+    except (EOFError, KeyboardInterrupt):
+        console.print("已取消回退。\n")
+        return True
+    modes = {"1": "conversation", "2": "files", "3": "both"}
+    if mode not in modes:
+        console.print("已取消回退。\n")
+        return True
+    try:
+        count = apply_rewind(state, selected.id, modes[mode])
+    except (OSError, ValueError) as error:
+        console.print(f"回退未完成：{error}", style="yellow", markup=False)
+        return True
+    console.print(f"回退完成，模式：{modes[mode]}；检查并恢复 {count} 个文件。", markup=False)
+    if mode != "2":
+        console.print("原会话保留，新分支继续；选中的用户输入已放回输入区，可编辑后提交。")
     return True
 
 
@@ -339,6 +407,7 @@ def cmd_api_detail(state: SessionState) -> bool:
 # 命令名 -> Command 对象；handler 只接收共享 state，统一用 bool 控制是否继续。
 # 添加命令时定义 cmd_* 函数并在此注册，main.py 的分发逻辑通常无需修改。
 COMMANDS = {
+    "rewind": Command("rewind", "回退到某轮需求之前：对话、代码或两者", cmd_rewind),
     "memory": Command("memory", "查看项目长期记忆索引及存储目录", cmd_memory),
     "tasks": Command("tasks", "查看当前会话的任务清单", cmd_tasks),
     "new": Command("new", "开启新会话", cmd_new),

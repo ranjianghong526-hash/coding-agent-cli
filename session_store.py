@@ -103,10 +103,14 @@ def save_session(state: "SessionState") -> None:
 def load_session(session_id: str) -> SavedSession:
     """恢复完整消息对象和累计统计，不调用模型，也不重新执行历史中的工具。"""
     from task_store import TaskDocument, TaskStore
+    from rewind_store import RewindDocument, RewindStore
+    from context_injection import is_system_reminder
 
     path = _session_path(session_id)
     task_path = TaskStore.path(session_id)
     tasks = TaskDocument.model_validate_json(task_path.read_bytes()) if task_path.exists() else None
+    rewind_path = RewindStore.path(session_id)
+    rewind = RewindDocument.model_validate_json(rewind_path.read_bytes()) if rewind_path.exists() else None
     turns, _ = _read_turns(path) if path.exists() else ([], 0)
     if not turns:
         if tasks is not None:
@@ -114,18 +118,29 @@ def load_session(session_id: str) -> SavedSession:
             title = tasks.tasks[0].subject if tasks.tasks else "仅任务记录"
             updated = datetime.fromtimestamp(task_path.stat().st_mtime, timezone.utc)
             return SavedSession(session_id, [], 0, 0, updated, title)
+        if rewind is not None and rewind.checkpoints:
+            # 失败轮次可能只有检查点及文件备份，仍要让 /resume 找回并 /rewind。
+            title = rewind.checkpoints[0].prompt[:60] or "仅检查点记录"
+            updated = datetime.fromtimestamp(rewind_path.stat().st_mtime, timezone.utc)
+            return SavedSession(session_id, [], 0, 0, updated, title)
         raise ValueError("会话没有完整记录")
     history = ModelMessagesTypeAdapter.validate_python([m for turn in turns for m in turn.messages])
-    title = "未命名会话"
+    title = rewind.checkpoints[0].prompt[:60] if rewind is not None and rewind.checkpoints else "未命名会话"
+    found = False
     for message in history:
+        if is_system_reminder(message):
+            continue
         for part in message.parts:
             if part.part_kind == "user-prompt":
                 title = " ".join(str(part.content).split())[:60] or title
+                found = True
                 break
-        if title != "未命名会话":
+        if found:
             break
     last = turns[-1]
     updated = max(last.saved_at, datetime.fromtimestamp(task_path.stat().st_mtime, timezone.utc)) if tasks is not None else last.saved_at
+    if rewind is not None:
+        updated = max(updated, datetime.fromtimestamp(rewind_path.stat().st_mtime, timezone.utc))
     return SavedSession(session_id, history, last.input_tokens, last.output_tokens, updated, title)
 
 
@@ -136,6 +151,7 @@ def list_sessions() -> tuple[list[SavedSession], list[str]]:
     # 独立任务在失败轮次也会保存，所以同时发现尚无聊天记录的任务会话。
     ids = {path.stem for path in SESSION_DIR.glob("*.jsonl")}
     ids.update(path.name.removesuffix(".tasks.json") for path in SESSION_DIR.glob("*.tasks.json"))
+    ids.update(path.name.removesuffix(".rewind.json") for path in SESSION_DIR.glob("*.rewind.json"))
     for session_id in sorted(ids):
         try:
             sessions.append(load_session(session_id))

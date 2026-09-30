@@ -1,13 +1,16 @@
 # My Claude Code CLI
 
-一个 Python 编程 Agent CLI，整体实现已对齐本地 `my-claude-code-mcp-完整项目`。支持文件读写与精确编辑、命令执行、工具审批、自动审查、任务管理、长期记忆、会话恢复、检查点回退、上下文压缩和 MCP。
+一个 Python 编程 Agent CLI，支持文件读写与精确编辑、命令执行、工具审批、自动审查、任务管理、长期记忆、会话恢复、检查点回退、上下文压缩、后台子 Agent 和 MCP。
 
-详细对照见 [参考项目对齐说明](参考项目对齐说明.md)，源码阅读见 [项目阅读路线](项目阅读路线.md)。
+源码阅读见 [项目阅读路线](项目阅读路线.md)。
 
 ## 启动
 
+以下为 Windows PowerShell 命令，每行分别执行。先在项目文件夹的上一级目录打开终端；如果已经位于项目根目录，跳过 `cd`。首次使用时创建虚拟环境，已有 `.venv` 则跳过创建步骤。
+
 ```powershell
-cd "C:\Users\A1455\Desktop\实习\coding-agent-cli"
+cd .\coding-agent-cli
+python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe main.py
 ```
@@ -114,7 +117,7 @@ Copy-Item .mcp.json.example .mcp.json
 
 文件读取状态独立，file_history 继承主会话，因此文件工具的修改可回退；shell 命令修改文件仍不在回退追踪范围内。并发 general Agent 应分配不同文件，避免交叉编辑。
 
-详细执行与数据链路见 [子 Agent 实现讲解](子Agent实现讲解.md)。
+子 Agent 的执行和审批链路可从 [subagents.py](subagents.py) 与 [run_agent 工具](agent/tools/agents.py) 阅读。
 
 ## 数据
 

@@ -29,7 +29,8 @@ MODES = [DEFAULT, ACCEPT_EDITS, AUTO, BYPASS]
 # 只读工具，任何模式都自动放行（读取不会改动系统，放行没风险）
 # task_* 工具只触碰 ~/.my-claude-code/tasks/ 下的私有数据目录，不影响用户工程目录和系统状态，按只读工具放行不弹审批
 # ask_user_question 工具本身就是问用户，再过审批就套娃，和 read_file 同等放行
-READONLY_TOOLS = {"read_file", "ask_user_question", "task_create", "task_list", "task_get", "task_update", "job_kill"}
+# run_agent 只安排协程；真正的文件/命令审批下沉到子 Agent 的每次工具调用。
+READONLY_TOOLS = {"read_file", "ask_user_question", "task_create", "task_list", "task_get", "task_update", "job_kill", "run_agent"}
 # 编辑文件类工具，acceptEdits 模式下自动放行
 EDIT_TOOLS = {"write_file", "edit_file"}
 
@@ -201,7 +202,7 @@ class _ApprovalPicker:
         return self.result if self.result is not None else "deny"
 
 
-async def prompt_approval(tool_name: str, args: dict) -> str:
+async def prompt_approval(tool_name: str, args: dict, requester: str = "") -> str:
     """
     工具执行前弹出审批 picker，返回 "once" / "always" / "deny"。
     """
@@ -211,6 +212,6 @@ async def prompt_approval(tool_name: str, args: dict) -> str:
         ("deny", "拒绝"),
     ]
     async with in_terminal():
-        question = f"是否允许执行 {_format_call(tool_name, args)}？"
+        question = f"{requester}是否允许执行 {_format_call(tool_name, args)}？"
         choice = await _ApprovalPicker(question, options).run()
     return choice

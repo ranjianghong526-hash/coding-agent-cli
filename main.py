@@ -6,6 +6,8 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 import compact
 import mcp_servers
+import subagents
+import permissions
 from legacy_migration import migrate_legacy_data
 import session
 from agent import agent, MODEL_NAME, api_call_log
@@ -133,7 +135,33 @@ async def watch_jobs(state, repl, interval=1):
                 repl.submit_system(text)
 
 
+async def watch_approvals(repl, interval=0.5):
+    """子 Agent 的审批只在主界面空闲时弹出，Future 把选择送回原工具。"""
+    while True:
+        await asyncio.sleep(interval)
+        if not repl.is_idle:
+            continue
+        request = subagents.pop_pending_approval()
+        if request is None:
+            continue
+        repl.approving = True
+        choice = "deny"
+        try:
+            choice = await permissions.prompt_approval(
+                request.tool_name, request.args,
+                requester=f"sub agent「{request.job.description}」（job {request.job.id}）请求：",
+            )
+        except Exception as error:
+            console.print(f"后台审批失败（{type(error).__name__}）：{error}", markup=False)
+        finally:
+            if not request.future.done():
+                request.future.set_result(choice)
+            repl.approving = False
+
+
 async def main():
+    for error in subagents.load_agent_types():
+        console.print(f"自定义 Agent 加载失败：{error}", markup=False)
     migrated = migrate_legacy_data()
     if migrated["sessions"] or migrated["memories"]:
         console.print(f"已导入旧数据：{migrated['sessions']} 个会话、{migrated['memories']} 条记忆。")
@@ -154,6 +182,7 @@ async def main():
     print_welcome_banner("my-claude-code")
 
     watcher = None
+    approval_watcher = None
     try:
         # 转圈提示连接进度，否则冷启动拉包时用户会以为卡死了
         with console.status("正在连接 MCP server..."):
@@ -203,6 +232,7 @@ async def main():
             background.schedule(state, result.new_messages())
 
         watcher = asyncio.create_task(watch_jobs(state, repl))
+        approval_watcher = asyncio.create_task(watch_approvals(repl))
         await repl.run(on_submit)
     finally:
         # 后台任务和 MCP 连接在正常退出、启动失败、取消时都能收尾。
@@ -210,6 +240,9 @@ async def main():
             if watcher:
                 watcher.cancel()
                 await asyncio.gather(watcher, return_exceptions=True)
+            if approval_watcher:
+                approval_watcher.cancel()
+                await asyncio.gather(approval_watcher, return_exceptions=True)
             try:
                 await state.job_registry.aclose()
             finally:

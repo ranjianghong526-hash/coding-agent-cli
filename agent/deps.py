@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from file_history import FileHistory
 from tasks_store import TasksStore
-from background_jobs import JobRegistry
+from background_jobs import JobRegistry, Job
 
 from .file_state import ReadFileState
 
@@ -19,3 +19,7 @@ class AgentDeps:
     file_history: FileHistory | None = None
     # 后台记忆 fork 不执行命令，因此可以不挂注册表。
     job_registry: JobRegistry | None = None
+    # 子 Agent 的父级 job，供后台工具审批标明请求来源。
+    subagent_job: Job | None = None
+    # 仅供旁路安全审查参考，不传给子 Agent 模型，保留真实用户授权来源。
+    user_authorization: list | None = None

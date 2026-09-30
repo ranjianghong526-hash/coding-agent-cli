@@ -6,8 +6,6 @@ import platform
 from datetime import date
 
 from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.deepseek import DeepSeekProvider
 
 from memory import store
 from memory.instructions import MEMORY_INSTRUCTIONS
@@ -15,18 +13,7 @@ from memory.instructions import MEMORY_INSTRUCTIONS
 from .deps import AgentDeps
 from .hooks import hooks
 from .tools import TOOLS
-
-# 从环境变量读取 API Key
-API_KEY = os.environ.get("API_KEY")
-if not API_KEY:
-    raise RuntimeError("请先设置环境变量 API_KEY")
-
-MODEL_NAME = "deepseek-flash"
-
-model = OpenAIChatModel(
-    MODEL_NAME,
-    provider=DeepSeekProvider(api_key=API_KEY),
-)
+from .model import model, MODEL_NAME
 
 # 静态 instructions 抽成常量，后台记忆 agent 直接复用，保证两边看到同一份约定
 INSTRUCTIONS = (
@@ -39,6 +26,11 @@ INSTRUCTIONS = (
     "后台 job 结束会收到 <task-notification>，不要主动轮询等待；"
     "期间可以用 read_file 读日志查看输出，用 job_kill 提前终止。"
     "如果有错误就修复并重新运行，直到确认正确。\n"
+    "只要结论、不要过程的任务用 run_agent 委派：探索代码、独立子任务或第二意见的审查。"
+    "sub agent 从空白上下文开始，prompt 必须完整交代背景、目标和约束。"
+    "sub agent 一律在后台运行，完成通知会在 <result> 中带回报告，你需要转述给用户。"
+    "派出后不要轮询等待，没有别的事就结束本轮；独立任务可以同时派出多个。"
+    "一两次工具调用能解决的简单任务不要委派。\n"
     "当你接到一个需要 3 步以上、或需要多次工具调用才能完成的任务时，"
     "先用 task_create 把分解出来的步骤建成 pending task，开工前用 task_update 把要做的那条切到 in_progress，做完立刻切 completed。"
     "如果是琐碎请求（1-2 步、纯对话、纯查询），不要建 task，建了反而碍事。做完的 task 不要让它一直挂在 in_progress。\n"
@@ -90,3 +82,9 @@ def project_context() -> str:
         parts.append(index)
 
     return "\n".join(parts)
+
+
+@agent.instructions
+def available_subagents() -> str:
+    import subagents
+    return subagents.agent_types_prompt()

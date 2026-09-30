@@ -15,9 +15,12 @@ def build_job_reminder_text(registry: JobRegistry | None) -> str | None:
         return None
     blocks = []
     for job in jobs:
+        guidance = "。最终报告见 result，可用 read_file 查看日志。" if job.kind == "agent" else "。请读取日志了解结果，再继续原任务。"
         fields = {"task-id": job.id, "task-type": job.kind,
                   "output-file": str(job.log_path), "status": job.status,
-                  "summary": job.summary() + "。请读取日志了解结果，再继续原任务。"}
+                  "summary": job.summary() + guidance}
+        if job.result is not None:
+            fields["result"] = job.result
         # 命令里可能有 <、>，转义后不能伪造通知标签。
         body = "\n".join(f"<{key}>{escape(value)}</{key}>" for key, value in fields.items())
         blocks.append(f"<task-notification>\n{body}\n</task-notification>")

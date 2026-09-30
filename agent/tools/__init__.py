@@ -11,6 +11,7 @@ from pydantic_ai import Tool
 # run_command 的高危特征自检挂上去，否则后续 default 模式下的危险命令直接放行
 from . import shell as _shell  # noqa: F401
 from .ask_user import ask_user_question
+from .agents import run_agent
 from .file import read_and_register, read_file, edit_file, write_file
 from .shell import run_command, job_kill
 from .tasks import task_create, task_get, task_list, task_update
@@ -24,6 +25,7 @@ TOOLS = [
     Tool(write_file, sequential=True),
     run_command,
     job_kill,
+    run_agent,
     task_create,
     task_list,
     task_get,

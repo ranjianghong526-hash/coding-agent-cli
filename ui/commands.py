@@ -702,7 +702,16 @@ def cmd_jobs(state: SessionState) -> bool:
     return True
 
 
+def cmd_agents(state: SessionState) -> bool:
+    import subagents
+    for item in subagents.list_agent_types():
+        source = "内置" if item.source == "built-in" else f"自定义：{item.source}"
+        console.print(f"{item.name}（{source}）\n  {item.description}\n  工具：{', '.join(item.tool_names)}", markup=False)
+    return True
+
+
 COMMANDS = {
+    "agents": Command("agents", "查看可用子 Agent 类型", cmd_agents),
     "jobs": Command("jobs", "查看当前会话的命令及日志", cmd_jobs),
     "new": Command("new", "开启新会话", cmd_new),
     "resume": Command("resume", "恢复历史会话", cmd_resume),

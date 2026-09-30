@@ -40,6 +40,7 @@ uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt
 | /status | 会话、模型、权限、上下文水位和 token |
 | /mcp | MCP 连接状态与工具 |
 | /jobs | 当前会话的命令、状态和日志路径 |
+| /agents | 内置和自定义子 Agent 类型 |
 | /memory | 查看记忆文件与索引 |
 | /dream | 立即整理合并记忆 |
 | /api-detail | 最近一轮模型请求摘要 |
@@ -47,7 +48,7 @@ uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt
 
 ## 工具和权限
 
-本地工具：read_file、edit_file、write_file、run_command、job_kill、task_create、task_list、task_get、task_update、ask_user_question。
+本地工具：read_file、edit_file、write_file、run_command、job_kill、run_agent、task_create、task_list、task_get、task_update、ask_user_question。
 
 已有文件修改前必须读取。read_file 支持 offset/limit 和行号；edit_file 精确匹配原文，不要把行号写入 old_string。登记的 mtime 过期时要求重读。写文件和任务更新通过 sequential=True 串行执行。
 
@@ -99,6 +100,22 @@ Copy-Item .mcp.json.example .mcp.json
 
 `pop_unnotified()` 领取时标记 notified=True，两条链路不会重复发送同一个通知。常驻服务没有结束就不会发完成通知，可随时查看日志或停止。`/new`、`/resume`、退出都会终止旧会话进程树；日志保留，恢复会话只恢复聊天，不重启旧命令。Windows 用 taskkill /T /F，POSIX 使用独立进程组。
 
+## 子 Agent
+
+实现依据为「后台运行 sub agent」文章。可要求「派一个 explore 子 Agent 调查项目结构」或「派两个子 Agent 分别调查模块划分和 TODO」。主模型通过 run_agent(description, prompt, agent_type) 委派；工具立即返回 a 开头的 job ID，子 Agent 在独立上下文工作，最终报告通过 task-notification 的 result 字段送回主模型，再由主模型转述。
+
+内置 explore 使用 read_file/run_command，指令要求只读调查；general 可额外使用 edit_file/write_file。子 Agent 不带主会话历史，不带记忆索引、任务面板或 MCP 工具，不能再调用 run_agent、ask_user_question、task_*、job_kill。与主 Agent 使用同一模型配置，最多 40 次模型请求。
+
+项目级 `.my-claude-code/agents/*.md` 定义自定义类型，启动时加载。name/description 必填，tools 是逗号分隔的白名单，省略时给四个允许的工具，正文作为独立指令。已提供 reviewer.md 示例；改完定义重启后用 `/agents` 查看。explore/reviewer 的只读约束来自工具裁剪和指令，run_command 本身仍是 shell 工具，并不是文件系统沙箱。
+
+子 Agent 中间消息写入 `jobs/<session_id>/<agent_id>.log`，它启动的命令日志在 `jobs/<session_id>/<agent_id>/<shell_id>.log`。主模型默认只收到报告，按需可读日志。底部区分 shell/agent 数量，`/jobs` 和 job_kill 同样适用；结束或被取消时清理它的命令进程。
+
+权限下沉到子 Agent 的每次工具调用：规则放行直接执行，auto 用分类器，人工审批进入队列。子 Agent await Future 暂停，主界面空闲时才弹出注明来源的审批框。选择 always 共享会话工具白名单，拒绝会作为工具结果让子 Agent在报告中说明。审批期间不会接受新一轮输入或投递完成通知。auto 审查参考真实父会话授权，不把主模型生成的委派 prompt 当成人类授权。
+
+文件读取状态独立，file_history 继承主会话，因此文件工具的修改可回退；shell 命令修改文件仍不在回退追踪范围内。并发 general Agent 应分配不同文件，避免交叉编辑。
+
+详细执行与数据链路见 [子 Agent 实现讲解](子Agent实现讲解.md)。
+
 ## 数据
 
 ```text
@@ -128,6 +145,8 @@ Copy-Item .mcp.json.example .mcp.json
 
 覆盖文件读取/编辑/过期校验、任务持久化、权限、序列化、回退、@ 引用、提醒阈值、压缩、记忆召回与后台闸门、重试、提问 picker、常驻输入键盘提交、中断、真实 MCP、并发连接、退出清理和旧数据迁移。模型均为模拟，不消耗真实模型 API。
 
-新增 test_background_jobs.py，验证真实命令日志、退出码、前台超时/取消、后台通知去重、SDK 工具 schema 与权限、忙时提醒、空闲自动续跑、真实 Ctrl+B、会话切换与 Windows 子进程树清理。当前整套 34 项测试通过。
+test_background_jobs.py 验证命令日志、退出码、超时/取消、通知去重、SDK schema 与权限、忙时提醒、空闲续跑、真实 Ctrl+B、会话切换与 Windows 进程树清理。test_subagents.py 增加隔离、报告回传、并行、失败、审批冒泡、拒绝、白名单、回退、自定义类型、请求上限和取消清理验证。
+
+当前整套 46 项测试通过；模型均模拟，命令与 Windows 进程树清理使用真实临时进程。
 
 改动前源码和旧接口测试在 `.reference-migration-backup/before-reference-alignment/`。目录被 Git 忽略；当前测试针对对齐后的接口。

@@ -62,6 +62,7 @@ class Repl:
         # 当前处理输入的后台任务，ESC / Ctrl+C 据此打断；None 表示空闲
         self._task = None
         self._exiting = False
+        self.approving = False
         # 是否正在请求模型，决定上方 working... 指示器的显隐
         self.working = False
         self._work_start = 0.0
@@ -96,8 +97,10 @@ class Repl:
         # 输入框下方那行：当前权限模式 + 切换提示
         mode = permissions.state.mode
         registry = self.state.job_registry
-        count = sum(job.background for job in registry.running()) if registry else 0
-        return HTML(f"  <ansimagenta><b>▶▶ {mode}</b></ansimagenta><ansibrightblack>（Shift+Tab 切换 · Ctrl+B 转后台 · 后台 {count}）</ansibrightblack>")
+        jobs = [job for job in registry.running() if job.background] if registry else []
+        shells = sum(job.kind == "shell" for job in jobs)
+        agents = sum(job.kind == "agent" for job in jobs)
+        return HTML(f"  <ansimagenta><b>▶▶ {mode}</b></ansimagenta><ansibrightblack>（Shift+Tab 切换 · Ctrl+B 转后台 · {shells} shell / {agents} agent）</ansibrightblack>")
 
     def _divider(self):
         # 一条横向分割线
@@ -199,7 +202,7 @@ class Repl:
             self._buffer.apply_completion(self._buffer.complete_state.current_completion)
             return
         # 请求中不接受新提交（输入框仍在，只是回车不触发新一轮）
-        if self._task is not None:
+        if self._task is not None or self.approving:
             return
         text = self._buffer.text.strip()
         if not text:
@@ -223,7 +226,7 @@ class Repl:
 
     @property
     def is_idle(self):
-        return self._task is None and not self._exiting and self._on_submit is not None
+        return self._task is None and not self._exiting and not self.approving and self._on_submit is not None
 
     def submit_system(self, text) -> bool:
         """提交系统通知；保留用户尚未发送的草稿，不回显成用户输入。"""

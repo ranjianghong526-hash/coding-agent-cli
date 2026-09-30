@@ -51,7 +51,7 @@ uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt
 
 ## 工具和权限
 
-本地工具：read_file、edit_file、write_file、run_command、job_kill、run_agent、monitor、task_create、task_list、task_get、task_update、ask_user_question。
+本地工具：load_skill、read_file、edit_file、write_file、run_command、job_kill、run_agent、monitor、task_create、task_list、task_get、task_update、ask_user_question。
 
 已有文件修改前必须读取。read_file 支持 offset/limit 和行号；edit_file 精确匹配原文，不要把行号写入 old_string。登记的 mtime 过期时要求重读。写文件和任务更新通过 sequential=True 串行执行。
 
@@ -159,6 +159,30 @@ Add-Content -Path app.log -Value "ERROR database connection refused" -Encoding u
 
 详细解释见 [图片输入讲解](图片输入讲解.md)。test_images.py 验证图文顺序、混合引用、工具返回、真实 SDK 请求映射（模拟 HTTP）、历史恢复、回退、剪贴板分支与模拟终端按键，不调用真实模型或改变真实剪贴板。
 
+## 渐进式 Skills
+
+按「渐进式加载 Skills」教程实现三层加载：动态 instructions 每次只加入名称和描述；模型根据任务调用 load_skill 取得完整正文；参考资料与脚本再使用 read_file/run_command 按需处理。加载说明自动放行，执行脚本沿用命令权限审批。
+
+个人级目录是 `~/.my-claude-code/skills/`，项目级目录是 `.my-claude-code/skills/`，同名合法 Skill 以项目级为准。只发现 `<根目录>/<名称>/SKILL.md`，不递归发现 references/scripts 中的文件。启动时显示发现结果；之后每次请求重新发现，无需为新增或修改 Skill 重启程序。
+
+SKILL.md 使用 UTF-8，开头格式：
+
+```markdown
+---
+name: reviewing-code
+description: 审查代码正确性、回归风险和测试缺口。用户要求代码审查时使用。
+---
+
+# 代码审查
+先阅读真实 diff 和调用链，再检查边界条件与测试。
+```
+
+name 必须与目录名一致，最多 64 字符，只含小写字母、数字和单个分隔连字符；description 必填，最多 1024 字符，不含尖括号。frontmatter 最多扫描 128 行，支持单行普通文本、双引号和单引号字符串，不支持多行 YAML 的 `>`/`|`。坏元数据被跳过，未知名称或正文读取失败以 ModelRetry 反馈模型。
+
+已提供 `.my-claude-code/skills/reviewing-code/SKILL.md` 和 `references/database.md` 示例。启动后输入「总结一次代码审查应该遵循哪些步骤」，模型可以按描述选择 load_skill；参考资料只有数据库相关任务才需要读取。目录提示用于引导模型，不是 Python 的关键词触发规则。
+
+完整讲解见 [Skills 渐进式加载讲解](Skills渐进式加载讲解.md)。test_skills.py 用模拟模型验证三层内容进入请求的时机、同名覆盖、坏元数据、动态更新、SDK 工具 schema、只读审批和历史恢复。此工具注册在主 Agent 的 TOOLS 中。
+
 ## 数据
 
 ```text
@@ -166,6 +190,7 @@ Add-Content -Path app.log -Value "ERROR database connection refused" -Encoding u
 ├── mcp.json
 ├── mcp-logs/
 ├── clipboard/                  # 每次粘贴的 PNG；图片数据也随会话保存
+├── skills/<名称>/SKILL.md       # 个人级 Skill，项目目录同名定义优先
 ├── jobs/<session_id>/<job_id>.log # 命令输出；注册表和进程状态只在内存中
 ├── tasks/<session_id>/           # 每条 task 一个 JSON
 └── projects/<项目路径编码>/

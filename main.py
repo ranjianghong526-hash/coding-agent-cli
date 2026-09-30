@@ -6,6 +6,7 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 import compact
 import images
+import skills
 import mcp_servers
 import subagents
 import permissions
@@ -186,6 +187,9 @@ async def main():
         job_registry=JobRegistry(session_id, print_job_finished),
     )
     print_welcome_banner("my-claude-code")
+    discovered = skills.discover_skills()
+    if discovered:
+        console.print(f"发现 {len(discovered)} 个 skill：" + ", ".join(item.name for item in discovered), markup=False)
 
     watcher = None
     approval_watcher = None

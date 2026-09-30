@@ -3,6 +3,7 @@ Agent 实例化：把 model / instructions / tools / hooks 拼起来，再加上
 """
 import os
 import platform
+import skills
 from datetime import date
 
 from pydantic_ai import Agent
@@ -83,6 +84,12 @@ def project_context() -> str:
         parts.append("")
         parts.append(f"以下是你的记忆索引 MEMORY.md（位于 {store.index_path()}，跨会话保留），需要某条记忆的完整内容就用 read_file 读记忆目录下的对应文件：")
         parts.append(index)
+
+    # 第一层只注入名称与描述，正文由 load_skill 工具按需加入对话。
+    listing = skills.format_skill_listing(skills.discover_skills())
+    if listing:
+        parts.append("")
+        parts.append(listing)
 
     return "\n".join(parts)
 

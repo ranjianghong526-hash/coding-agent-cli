@@ -13,6 +13,7 @@ from . import shell as _shell  # noqa: F401
 from .ask_user import ask_user_question
 from .agents import run_agent
 from .monitor import monitor
+from .skills import load_skill
 from .file import read_and_register, read_file, edit_file, write_file
 from .shell import run_command, job_kill
 from .tasks import task_create, task_get, task_list, task_update
@@ -21,6 +22,7 @@ from .tasks import task_create, task_get, task_list, task_update
 # 否则它们会基于同一份旧快照并发写盘、互相覆盖（这正是 readFileState + mtime 想防住的并发问题）
 # task_update 也标记 sequential=True：同一轮里连续改同一条 task，并发会基于同一份旧快照覆盖（store 没加锁）
 TOOLS = [
+    load_skill,
     read_file,
     Tool(edit_file, sequential=True),
     Tool(write_file, sequential=True),

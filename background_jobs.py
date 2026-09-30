@@ -7,13 +7,26 @@ import secrets
 import signal
 import string
 import subprocess
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
 
 JOBS_ROOT = Path.home() / ".my-claude-code" / "jobs"
 _ID_ALPHABET = string.digits + string.ascii_lowercase
 JobStatus = Literal["running", "completed", "failed", "killed"]
+EVENT_WINDOW = 10.0
+MAX_EVENTS_PER_WINDOW = 20
+MAX_PENDING_EVENTS = 200
+MAX_DROPPED_EVENTS = 100
+MAX_EVENT_CHARS = 500
+
+
+def _process_options() -> dict:
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return {"env": env, **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+                            if os.name == "nt" else {"start_new_session": True})}
 
 
 def _new_job_id(prefix: str = "b") -> str:
@@ -65,11 +78,27 @@ class Job:
     background: bool = True
     kill_func: Callable[[], None] | None = None
     result: str | None = None
+    pending_events: list[str] = field(default_factory=list)
+    dropped_events: int = 0
+    dropped_total: int = 0
+    window_start: float = field(default_factory=time.monotonic)
+    window_count: int = 0
+
+    def push_event(self, line: str) -> None:
+        now = time.monotonic()
+        if now - self.window_start >= EVENT_WINDOW:
+            self.window_start, self.window_count = now, 0
+        self.window_count += 1
+        if self.window_count > MAX_EVENTS_PER_WINDOW or len(self.pending_events) >= MAX_PENDING_EVENTS:
+            self.dropped_events += 1
+            self.dropped_total += 1
+            return
+        self.pending_events.append(line[:MAX_EVENT_CHARS])
 
     def summary(self) -> str:
         status = {"completed": "执行成功", "failed": "执行失败", "killed": "已被终止"}.get(self.status, "运行中")
         code = f"，exit code {self.returncode}" if self.returncode is not None else ""
-        label = "sub agent" if self.kind == "agent" else "后台命令"
+        label = {"agent": "sub agent", "monitor": "monitor"}.get(self.kind, "后台命令")
         return f"{label}「{self.description}」{status}{code}"
 
 
@@ -141,14 +170,9 @@ class JobRegistry:
                 break
             except FileExistsError:
                 continue
-        options = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
-                   if os.name == "nt" else {"start_new_session": True})
-        env = os.environ.copy()
-        # Windows 下 Python 重定向输出默认可能是 GBK，文件工具按 UTF-8 读取日志。
-        env.setdefault("PYTHONIOENCODING", "utf-8")
         try:
             proc = await asyncio.create_subprocess_shell(
-                command, stdout=log_file, stderr=subprocess.STDOUT, env=env, **options,
+                command, stdout=log_file, stderr=subprocess.STDOUT, **_process_options(),
             )
         except BaseException:
             log_file.close()
@@ -160,6 +184,87 @@ class JobRegistry:
         self._watchers.add(watcher)
         watcher.add_done_callback(self._watchers.discard)
         return job
+
+    async def spawn_monitor(self, command: str, description: str, timeout: float | None) -> Job:
+        if self._closing:
+            raise RuntimeError("当前会话正在关闭，不能再启动 monitor")
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout 必须大于 0")
+        self._jobs_dir.mkdir(parents=True, exist_ok=True)
+        while True:
+            job_id = _new_job_id("m")
+            log_path = self._jobs_dir / f"{job_id}.log"
+            try:
+                with log_path.open("x", encoding="utf-8"):
+                    pass
+                break
+            except FileExistsError:
+                continue
+        proc = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE,
+                                                     stderr=subprocess.STDOUT, limit=1024 * 1024,
+                                                     **_process_options())
+        job = Job(job_id, "monitor", description, log_path, notified=True,
+                  kill_func=lambda: _kill_process_tree(proc.pid))
+        self._jobs[job_id], self._processes[job_id] = job, proc
+        watcher = asyncio.create_task(self._pump_monitor(job, proc, timeout))
+        self._watchers.add(watcher)
+        watcher.add_done_callback(self._watchers.discard)
+        return job
+
+    def _stop_monitor(self, job: Job, note: str) -> None:
+        if job.status != "running":
+            return
+        self.kill(job.id, notify=False)
+        # 控制事件不受输出限流限制，确保模型得知为什么停止。
+        job.pending_events.append(f"[{note}]")
+
+    async def _monitor_timeout(self, job: Job, timeout: float) -> None:
+        await asyncio.sleep(timeout)
+        self._stop_monitor(job, f"monitor 已停止：到了 {timeout:g} 秒的超时上限，需要时重新挂载")
+
+    async def _pump_monitor(self, job: Job, proc, timeout: float | None) -> None:
+        timer = asyncio.create_task(self._monitor_timeout(job, timeout)) if timeout is not None else None
+        try:
+            with job.log_path.open("a", encoding="utf-8", buffering=1) as log:
+                try:
+                    async for raw in proc.stdout:
+                        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                        log.write(line + "\n")
+                        if not line.strip() or job.status != "running":
+                            continue
+                        job.push_event(line)
+                        if job.dropped_total >= MAX_DROPPED_EVENTS:
+                            self._stop_monitor(job, "monitor 已停止：输出太多，请用更精确的过滤条件重新挂载")
+                except ValueError:
+                    self._stop_monitor(job, "monitor 已停止：单行输出过长，请先在命令中截断或过滤")
+                    # 管道过长行会暂停 transport；终止后仍需排空，避免 proc.wait 卡住。
+                    while raw := await proc.stdout.read(65536):
+                        log.write(raw.decode("utf-8", errors="replace"))
+                job.returncode = await proc.wait()
+                if job.status != "killed":
+                    job.status = "completed" if job.returncode == 0 else "failed"
+                    job.pending_events.append(f"[monitor 已停止：被监控的命令自己退出了，exit code {job.returncode}]")
+        except (OSError, RuntimeError) as error:
+            # 后台 IO 边界：失败也作为事件交回，不能遗留无人领取的异常或进程。
+            if job.status == "running":
+                self.kill(job.id, notify=False)
+            job.status = "failed"
+            job.pending_events.append(f"[monitor 读取失败（{type(error).__name__}）：{error}]")
+        finally:
+            if timer:
+                timer.cancel()
+                await asyncio.gather(timer, return_exceptions=True)
+        if not self._closing and self._on_completed:
+            self._on_completed(job)
+
+    def pop_events(self) -> list[tuple[Job, list[str], int]]:
+        out = []
+        for job in self._jobs.values():
+            if job.kind == "monitor" and (job.pending_events or job.dropped_events):
+                out.append((job, job.pending_events, job.dropped_events))
+                job.pending_events = []
+                job.dropped_events = 0
+        return out
 
     async def _watch(self, job: Job, proc, log_file) -> None:
         try:
@@ -186,18 +291,20 @@ class JobRegistry:
             job.background = True
         return jobs
 
-    def kill(self, job_id: str) -> bool:
+    def kill(self, job_id: str, *, notify: bool = True) -> bool:
         job = self.get(job_id)
         if job is None or job.status != "running":
             return False
         if job.kill_func:
             job.kill_func()
         job.status = "killed"
+        if job.kind == "monitor" and notify and not self._closing:
+            job.pending_events.append("[monitor 已停止：用户或 Agent 请求终止]")
         return True
 
     def pop_unnotified(self) -> list[Job]:
         jobs = [job for job in self._jobs.values()
-                if job.background and job.status != "running" and not job.notified]
+                if job.kind != "monitor" and job.background and job.status != "running" and not job.notified]
         for job in jobs:
             job.notified = True
         return jobs

@@ -12,7 +12,7 @@ from legacy_migration import migrate_legacy_data
 import session
 from agent import agent, MODEL_NAME, api_call_log
 from agent.deps import AgentDeps
-from agent.reminders import build_job_reminder_text
+from agent.reminders import build_job_notifications
 from background_jobs import JobRegistry
 from ui.render import print_job_finished
 from file_history import FileHistory
@@ -125,11 +125,11 @@ async def run_agent_loop(user_input, state):
 
 
 async def watch_jobs(state, repl, interval=1):
-    """仅扫描本地状态，不请求模型；空闲且 job 完成时才提交通知。"""
+    """仅扫描本地状态；空闲且有完成通知或 monitor 新事件时才唤醒模型。"""
     while True:
         await asyncio.sleep(interval)
         if repl.is_idle:
-            text = build_job_reminder_text(state.job_registry)
+            text = build_job_notifications(state.job_registry)
             if text:
                 # 检查、领取、提交之间没有 await，避免与用户回车抢占。
                 repl.submit_system(text)

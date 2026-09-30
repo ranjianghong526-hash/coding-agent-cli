@@ -19,7 +19,7 @@ import permissions
 from ui.render import console, print_step, print_system_text
 
 from .deps import AgentDeps
-from .reminders import build_reminder_text, build_task_reminder_text, build_job_reminder_text
+from .reminders import build_reminder_text, build_task_reminder_text, build_job_notifications
 
 
 MAX_RETRIES = 3
@@ -147,7 +147,7 @@ _REMINDER_SENTINELS = {
     "task": "task 工具最近没有被使用",
 }
 def _build_job_reminder(ctx, messages):
-    return build_job_reminder_text(ctx.deps.job_registry)
+    return build_job_notifications(ctx.deps.job_registry)
 
 
 _REMINDER_BUILDERS = (_build_file_reminder, _build_task_reminder, _build_job_reminder)
@@ -156,7 +156,8 @@ _REMINDER_BUILDERS = (_build_file_reminder, _build_task_reminder, _build_job_rem
 @hooks.on.before_model_request
 async def _inject_reminders(ctx, request_context):
     """
-    依次跑每个注册过的 reminder builder：返回非 None 的就拼到 request_context.messages 末尾。当前两条：过期文件提醒（看 readFileState）+ task 提醒（看 turn 计数 + tasks_store）。要加第 3 种 reminder 时只需多写一个 builder，不必再复制一次 hook 框架。
+    依次运行 builder，将过期文件提醒、task 提醒、后台完成通知与 monitor 事件
+    追加到本次请求的 messages。没有新提醒时保持原请求。
     """
     messages = list(request_context.messages)
     appended = []

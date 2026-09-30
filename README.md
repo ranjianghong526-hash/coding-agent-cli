@@ -51,7 +51,7 @@ uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt
 
 ## 工具和权限
 
-本地工具：read_file、edit_file、write_file、run_command、job_kill、run_agent、task_create、task_list、task_get、task_update、ask_user_question。
+本地工具：read_file、edit_file、write_file、run_command、job_kill、run_agent、monitor、task_create、task_list、task_get、task_update、ask_user_question。
 
 已有文件修改前必须读取。read_file 支持 offset/limit 和行号；edit_file 精确匹配原文，不要把行号写入 old_string。登记的 mtime 过期时要求重读。写文件和任务更新通过 sequential=True 串行执行。
 
@@ -119,6 +119,30 @@ Copy-Item .mcp.json.example .mcp.json
 
 子 Agent 的执行和审批链路可从 [subagents.py](subagents.py) 与 [run_agent 工具](agent/tools/agents.py) 阅读。
 
+## 持续事件监控
+
+后台命令等结束才通知一次，monitor 在运行期间持续将非空输出行推送给主模型，适合“每次出现 ERROR 都告诉我”。monitor 创建真实进程，沿用命令权限审批和高危自检，不属于只读白名单，也不开放给子 Agent。
+
+Windows 示例：先在项目目录创建 app.log，然后向 Agent 输入：
+
+```text
+用 monitor 运行 .venv\Scripts\python.exe -u examples/watch_log.py app.log --match ERROR，持续监听新出现的 ERROR，出现时告诉我。timeout 设置为 300 秒。
+```
+
+在另一个位于同一项目目录的 PowerShell 终端追加日志：
+
+```powershell
+Add-Content -Path app.log -Value "ERROR database connection refused" -Encoding utf8
+```
+
+初次监听跳过现有内容，只输出新行；示例脚本支持日志被截短或替换。命令自行决定过滤哪些内容，monitor 将它实际输出的非空行作为事件。Linux/macOS 可使用 `tail -n 0 -F app.log | grep --line-buffered ERROR`。管道每级应及时 flush，stderr 也要过滤时使用 `2>&1`，过滤条件要考虑失败信号。
+
+默认超时 300 秒，persistent=True 不设超时；job_kill、会话切换和退出仍会清理。状态栏显示 monitor 数量，/jobs 显示 m 开头的 ID。事件先落盘，再入队，忙时在下一次请求注入，空闲时自动唤醒主模型；取出即清空，避免重复。事件不是用户回复，也不作为 auto 审查的用户授权。
+
+每个 monitor 固定 10 秒窗口最多接收 20 条，队列最多 200 条，单条事件截断到 500 字符；超额事件计数，通知携带 dropped。累计丢弃 100 条会自动停止。超时、退出、手动停止和过长行都通过事件通道说明，不再重复发送 task-notification。限流是每个 monitor 的保护，不能保证整个会话的上下文或日志磁盘总量有严格上限。
+
+实现链路：monitor 工具 → JobRegistry.spawn_monitor → stdout PIPE → _pump_monitor → pending_events → build_job_notifications → hook / watch_jobs → 主模型回答。详细解释见 [持续事件监控讲解](持续事件监控讲解.md)。
+
 ## 数据
 
 ```text
@@ -150,6 +174,6 @@ Copy-Item .mcp.json.example .mcp.json
 
 test_background_jobs.py 验证命令日志、退出码、超时/取消、通知去重、SDK schema 与权限、忙时提醒、空闲续跑、真实 Ctrl+B、会话切换与 Windows 进程树清理。test_subagents.py 增加隔离、报告回传、并行、失败、审批冒泡、拒绝、白名单、回退、自定义类型、请求上限和取消清理验证。
 
-当前整套 46 项测试通过；模型均模拟，命令与 Windows 进程树清理使用真实临时进程。
+test_monitor.py 验证运行中事件、多批通知、日志、退出/超时、限流/队列/熔断、过长行、权限、事件转义、会话标题和忙时/空闲投递。模型均模拟，命令与 Windows 进程树清理使用真实临时进程。
 
 改动前源码和旧接口测试在 `.reference-migration-backup/before-reference-alignment/`。目录被 Git 忽略；当前测试针对对齐后的接口。

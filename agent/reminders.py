@@ -32,6 +32,23 @@ def _wrap(lines: list[str]) -> str:
     return f"<system-reminder>\n{chr(10).join(lines)}\n</system-reminder>"
 
 
+def build_monitor_event_text(registry: JobRegistry | None) -> str | None:
+    blocks = []
+    for job, events, dropped in registry.pop_events() if registry else []:
+        omitted = (f"<dropped>另有 {dropped} 条事件因为输出过快或队列已满被省略，"
+                   "需要时用更精确的过滤条件重新挂载</dropped>\n") if dropped else ""
+        blocks.append(f"<monitor-event>\n<task-id>{job.id}</task-id>\n"
+                      f"<description>{escape(job.description, quote=False)}</description>\n"
+                      f"<events>\n{escape(chr(10).join(events), quote=False)}\n</events>\n"
+                      f"{omitted}</monitor-event>")
+    return "\n\n".join(blocks) or None
+
+
+def build_job_notifications(registry: JobRegistry | None) -> str | None:
+    parts = [build_job_reminder_text(registry), build_monitor_event_text(registry)]
+    return "\n\n".join(part for part in parts if part) or None
+
+
 def build_reminder_text(state: ReadFileState) -> str | None:
     """
     根据当前会话状态拼出提醒正文；没什么值得提醒的就返回 None。

@@ -100,7 +100,8 @@ class Repl:
         jobs = [job for job in registry.running() if job.background] if registry else []
         shells = sum(job.kind == "shell" for job in jobs)
         agents = sum(job.kind == "agent" for job in jobs)
-        return HTML(f"  <ansimagenta><b>▶▶ {mode}</b></ansimagenta><ansibrightblack>（Shift+Tab 切换 · Ctrl+B 转后台 · {shells} shell / {agents} agent）</ansibrightblack>")
+        monitors = sum(job.kind == "monitor" for job in jobs)
+        return HTML(f"  <ansimagenta><b>▶▶ {mode}</b></ansimagenta><ansibrightblack>（Shift+Tab 切换 · Ctrl+B 转后台 · {shells} shell / {agents} agent / {monitors} monitor）</ansibrightblack>")
 
     def _divider(self):
         # 一条横向分割线

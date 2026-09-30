@@ -5,6 +5,7 @@ from pydantic_graph import End
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 import compact
+import images
 import mcp_servers
 import subagents
 import permissions
@@ -26,7 +27,7 @@ from ui.commands import (
     print_welcome_banner,
 )
 from ui.input_ui import Repl
-from mentions import build_mention_messages, extract_at_mentions
+from mentions import build_mention_messages, extract_at_mentions, replace_image_mentions
 
 
 async def handle_command(user_input, state):
@@ -68,31 +69,36 @@ def apply_result(state, result):
     session.append_messages(state.session_id, result.new_messages())
 
 
-def inject_at_mentions(user_input, state):
+def inject_at_mentions(user_input, state, attachments=None):
     """
-    解析用户输入里的 @path，把每个被引用的文件伪装成一次 read_file 调用，在 Agent 跑起来之前塞进对话历史。
+    文本引用作为 read_file 记录加入历史；图片加入本轮附件，并在原位置替换占位符。
     """
     paths = extract_at_mentions(user_input)
     if not paths:
-        return
-    mention_messages = build_mention_messages(paths, state.read_file_state)
-    if not mention_messages:
-        return
+        return user_input
+    attachments = attachments if attachments is not None else []
+    start_index = len(attachments) + 1
+    image_paths = []
+    mention_messages = build_mention_messages(paths, state.read_file_state, attachments, image_paths)
     # 塞进历史：模型下一轮就能看到这些「读文件」记录，以为是自己读的
     state.history += mention_messages
     # 持久化，/resume 恢复会话时能连同引用进来的文件内容一起还原
-    session.append_messages(state.session_id, mention_messages)
+    if mention_messages:
+        session.append_messages(state.session_id, mention_messages)
     # 终端里也回显一下注入了哪些文件，让用户看到 @ 引用确实生效了
     for msg in mention_messages:
         for part in msg.parts:
             print_part(part)
+    return replace_image_mentions(user_input, image_paths, start_index)
 
 
-async def run_agent_loop(user_input, state):
+async def run_agent_loop(user_input, state, attachments=None):
     """
     展开 agent.run_sync()，逐节点驱动 Agent 循环，每步实时打印。
     """
     api_call_log.clear()
+    if attachments:
+        user_input = images.build_user_content(user_input, attachments)
 
     # deps 把本会话的 readFileState、tasksStore 和文件检查点一起打包成 AgentDeps 注入工具层，工具内通过 ctx.deps.* 访问
     deps = AgentDeps(
@@ -193,7 +199,7 @@ async def main():
         # 常驻输入区：输入框整个会话期间不消失。task 面板通过 state.tasks_store 拉数据，所以 /new、/resume 换会话时不需要重新接线
         repl = Repl(state)
 
-        async def on_submit(user_input, is_system=False):
+        async def on_submit(user_input, is_system=False, attachments=None):
             if is_system:
                 await compact.auto_compact_if_needed(state)
                 notification = ModelRequest(parts=[UserPromptPart(user_input)],
@@ -221,13 +227,14 @@ async def main():
             state.file_history.make_checkpoint(len(state.history), user_input)
 
             # 解析 @ 引用，把被引用的文件伪装成 read_file 调用塞进历史
-            inject_at_mentions(user_input, state)
+            attachments = list(attachments or [])
+            user_input = inject_at_mentions(user_input, state, attachments)
 
             # 核心 Agent 循环：开请求时显示 working...，结束 / 被打断后由 Repl 统一隐藏；中途按 ESC / Ctrl+C 会打断
             repl.start_working()
             # 召回相关记忆塞进历史，模型带着过去积累的经验处理本轮输入
             await recall.inject_memories(user_input, state)
-            result = await run_agent_loop(user_input, state)
+            result = await run_agent_loop(user_input, state, attachments)
             # 本轮结束后由后台提炼记忆，并顺带检查是否到了该定期合并的时候
             background.schedule(state, result.new_messages())
 

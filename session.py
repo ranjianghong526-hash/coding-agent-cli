@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import uuid
+import images
 from datetime import datetime
 from pathlib import Path
 
@@ -99,7 +100,7 @@ def first_prompt(path: Path) -> str:
             for part in msg.get("parts", []):
                 if part.get("part_kind") != "user-prompt":
                     continue
-                content = str(part.get("content", ""))
+                content = images.prompt_text(part.get("content", "")) or "(图片消息)"
                 if content.startswith(("<system-reminder>", "<task-notification>", "<monitor-event>")):
                     continue
                 return content

@@ -4,6 +4,7 @@ auto 模式分类器：发起一次独立的 LLM 请求，判断一次工具调�
 把对话投影成转写（transcript），连同待审查的工具调用一起喂给一个旁路 LLM，拿回「放行还是拦截」的裁决。
 """
 import json
+import images
 import os
 
 from openai import AsyncOpenAI
@@ -67,12 +68,13 @@ def build_transcript(messages, tool_name: str, args: dict) -> str:
         for part in message.parts:
             # 用户消息：part_kind 是 user-prompt，content 是用户输入的文本
             if part.part_kind == "user-prompt":
+                text = images.prompt_text(part.content)
                 # SDK 的 user-prompt 也承载程序提醒；它们不能算作用户授权。
                 if (getattr(message, "metadata", None) or {}).get("origin") in {
                     "dynamic-reminder", "background-job-notification"
-                } or str(part.content).startswith(("<system-reminder>", "<task-notification>", "<monitor-event>")):
+                } or text.startswith(("<system-reminder>", "<task-notification>", "<monitor-event>")):
                     continue
-                lines.append(json.dumps({"user": str(part.content)}, ensure_ascii=False))
+                lines.append(json.dumps({"user": text}, ensure_ascii=False))
             # 工具调用：记下工具名和参数，让 classifier 看到 agent 一路做过什么
             elif part.part_kind == "tool-call":
                 call_args = {k: _shorten(v) for k, v in part.args_as_dict().items()}

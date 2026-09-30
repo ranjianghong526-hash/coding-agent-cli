@@ -1,6 +1,7 @@
 import asyncio
 import re
 import time
+import platform
 from html import escape as html_escape
 
 from prompt_toolkit.application import Application
@@ -19,6 +20,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from rich.markup import escape
 
 import permissions
+import images
 from mentions import list_candidate_files
 from .render import console, print_system_text
 
@@ -67,6 +69,10 @@ class Repl:
         self.working = False
         self._work_start = 0.0
         self._frame = 0
+        # 图片属于当前草稿；提交时快照，下一轮重新编号，防止旧图串进新请求。
+        self._attachments = []
+        self._pasting = False
+        self._draft_generation = 0
         # 给输入缓冲区挂上 @ 文件补全器，complete_while_typing 让候选随敲随出，不用按 Tab
         self._buffer = Buffer(
             multiline=False,
@@ -175,6 +181,8 @@ class Repl:
                 self._task.cancel()
             else:
                 self._buffer.reset()
+                self._attachments = []
+                self._draft_generation += 1
 
         @kb.add("c-d")
         def _(event):
@@ -195,7 +203,31 @@ class Repl:
                 console.print("已转后台：" + ", ".join(job.id for job in jobs), markup=False)
             event.app.invalidate()
 
+        # Windows 终端 Ctrl+V 常被普通粘贴占用，因此按教程用 Alt+V。
+        keys = ("escape", "v") if platform.system() == "Windows" else ("c-v",)
+        @kb.add(*keys)
+        def _(event):
+            if not self._pasting:
+                self._pasting = True
+                event.app.create_background_task(self._paste_image())
+
         return kb
+
+    async def _paste_image(self):
+        generation = self._draft_generation
+        try:
+            # 系统剪贴板命令可能等几秒，移出事件循环，输入区和 job watcher 继续运行。
+            image = await asyncio.to_thread(images.read_clipboard_image)
+            if generation != self._draft_generation or self._exiting:
+                return
+            if image is None:
+                console.print("没有取得剪贴板图片；请复制图片，或使用 @图片路径（Linux 需 xclip）。", markup=False)
+                return
+            self._attachments.append(image)
+            self._buffer.insert_text(f"[Image #{len(self._attachments)}]")
+        finally:
+            self._pasting = False
+            self.app.invalidate()
 
     def _on_enter(self):
         # 补全菜单正开着且有高亮项时，回车先采纳补全，不提交输入
@@ -203,19 +235,23 @@ class Repl:
             self._buffer.apply_completion(self._buffer.complete_state.current_completion)
             return
         # 请求中不接受新提交（输入框仍在，只是回车不触发新一轮）
-        if self._task is not None or self.approving:
+        if self._task is not None or self.approving or self._pasting:
             return
         text = self._buffer.text.strip()
         if not text:
             self._buffer.reset()
+            self._attachments = []
+            self._draft_generation += 1
             return
         # 存进输入历史，清空输入行
         self._buffer.history.append_string(text)
+        attachments, self._attachments = self._attachments, []
+        self._draft_generation += 1
         self._buffer.reset()
         # 把这行回显到上方滚动区，留下记录（输入框常驻，不回显的话提交后这行就没了）
         self._echo_input(text)
         # 把处理丢进后台任务，回车处理立刻返回，输入框继续渲染、随时能打断
-        self._task = self.app.create_background_task(self._process(text))
+        self._task = self.app.create_background_task(self._process(text, attachments=attachments))
 
     def _echo_input(self, text):
         # 回显刚提交的一行：上下分割线夹住 ❯ 文本，和输入框观感一致
@@ -237,11 +273,13 @@ class Repl:
         self._task = self.app.create_background_task(self._process(text, is_system=True))
         return True
 
-    async def _process(self, text, is_system=False):
+    async def _process(self, text, is_system=False, attachments=None):
         # 后台任务：交给 on_submit，统一兜住打断和异常
         try:
             if is_system:
                 await self._on_submit(text, is_system=True)
+            elif attachments:
+                await self._on_submit(text, attachments=attachments)
             else:
                 await self._on_submit(text)
         except asyncio.CancelledError:
@@ -256,6 +294,8 @@ class Repl:
                 self._buffer.text = self.state.pending_input
                 self._buffer.cursor_position = len(self.state.pending_input)
                 self.state.pending_input = ""
+                self._attachments = self.state.pending_images
+                self.state.pending_images = []
             self.app.invalidate()
 
     def start_working(self):

@@ -8,11 +8,12 @@ readFileState 通过 RunContext 作为依赖注入，每个会话各有一份互
 """
 import os
 
-from pydantic_ai import RunContext
+from pydantic_ai import BinaryContent, RunContext
 from pydantic_ai.exceptions import ModelRetry
 
 from ..deps import AgentDeps
 from ..file_state import ReadFileState
+import images
 
 # 不指定 limit 时最多读多少行，超出的截断并提示模型用 offset 续读
 DEFAULT_MAX_LINES = 2000
@@ -62,17 +63,25 @@ def read_and_register(state: ReadFileState, path: str, offset: int = 1, limit: i
     return result
 
 
-def read_file(ctx: RunContext[AgentDeps], path: str, offset: int = 1, limit: int | None = None) -> str:
+def read_file(ctx: RunContext[AgentDeps], path: str, offset: int = 1, limit: int | None = None) -> str | BinaryContent:
     """
     读取文件内容，输出带行号（类似 cat -n 格式）。
     大文件请用 offset 和 limit 分段读取，不必一次读完。
     后续用 edit_file 编辑时，old_string 和 new_string 里不要包含行号前缀。
+    支持 png/jpg/jpeg/gif/webp，图片按图像内容返回，offset/limit 仅用于文本。
+    用户提供截图或设计稿路径时，用此工具查看图片。
 
     Args:
         path: 要读取的文件的绝对路径
         offset: 从第几行开始读，从 1 算起（默认 1 = 文件开头）
         limit: 读多少行；不传则最多读 DEFAULT_MAX_LINES 行
     """
+    if images.is_image(path):
+        try:
+            return images.load_image(path)
+        except (OSError, ValueError) as error:
+            raise ModelRetry(f"无法读取图片 {path}：{error}") from error
+
     # 1. 去重：readFileState 里有记录、来自 read_file（offset 非 None）、同范围、同 mtime → 跳过
     state = ctx.deps.read_file_state
     record = state.get(path)

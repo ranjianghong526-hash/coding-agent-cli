@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Optional
+from pydantic_ai import BinaryContent
 
 import questionary
 from prompt_toolkit.application import Application, in_terminal
@@ -20,6 +21,7 @@ import compact
 import mcp_servers
 import permissions
 import session
+import images
 from agent import ReadFileState
 from file_history import FileHistory
 from background_jobs import JobRegistry
@@ -65,6 +67,7 @@ class SessionState:
     file_history: FileHistory | None = None
     # /rewind 回退对话后待回填输入框的原 prompt，Repl 在命令结束后消费
     pending_input: str = ""
+    pending_images: list[BinaryContent] = field(default_factory=list)
     # 自动压缩连续失败的次数，达到上限后不再重试
     compact_failures: int = 0
     # 只管理本次运行中的进程；日志保留在磁盘，恢复会话不会重启旧命令。
@@ -105,7 +108,7 @@ def _format_part_line(part) -> Optional[str]:
     # 内容行统一缩进 2 格，和图标（占 2 格：图标 + 空格）后的 role 名对齐
     kind = part.part_kind
     if kind == "user-prompt":
-        return f"[cyan]❯ user[/]\n  {_truncate(part.content)}"
+        return f"[cyan]❯ user[/]\n  {_truncate(images.content_summary(part.content))}"
     if kind == "thinking":
         # thinking 整块 dim，弱化视觉权重；不截断，完整保留思考过程
         return f"[dim]✻ thinking[/]\n  [dim]{_full(part.content)}[/]"
@@ -120,7 +123,7 @@ def _format_part_line(part) -> Optional[str]:
         return f"[yellow]⏺ tool_call[/]\n  [yellow dim]{part.tool_name}({_truncate(part.args, 500)})[/]"
     if kind == "tool-return":
         # 工具成功返回，标签用 ✔
-        return f"[magenta]✔ tool_return[/]\n  [magenta dim]{part.tool_name} -> {_truncate(part.content)}[/]"
+        return f"[magenta]✔ tool_return[/]\n  [magenta dim]{part.tool_name} -> {_truncate(images.content_summary(part.content))}[/]"
     if kind == "retry-prompt":
         # 工具抛 ModelRetry 后，SDK 生成 retry-prompt 把错误反馈给模型，标签用 ✘ 表示这次调用失败
         return f"[yellow]✘ tool_retry[/]\n  [yellow dim]{part.tool_name} -> {_truncate(part.content)}[/]"
@@ -195,7 +198,7 @@ def _print_file_op(part) -> bool:
         # read_file 的返回已经是带行号的内容，按行截断预览
         console.print("[magenta]✔ tool_return[/]")
         console.print(Padding("[magenta dim]read_file[/]", (0, 0, 0, 2)))
-        lines = str(part.content).splitlines()
+        lines = images.content_summary(part.content).splitlines()
         for ln in lines[:_PREVIEW_MAX_LINES]:
             console.print(f"  [dim]{escape(ln)}[/]")
         if len(lines) > _PREVIEW_MAX_LINES:
@@ -566,13 +569,25 @@ async def cmd_rewind(state: SessionState) -> bool:
     if channel in ("both", "code"):
         fh.rewind_files(cp)
     if channel in ("both", "conversation"):
+        # 多模态输入随历史保存；截断前取出图片，回填原话时一并回填附件。
+        state.pending_images = []
+        state.pending_input = cp.prompt
+        cp_index = fh.checkpoints.index(cp)
+        end = fh.checkpoints[cp_index + 1].history_index if cp_index + 1 < len(fh.checkpoints) else len(state.history)
+        for message in state.history[cp.history_index:end]:
+            for part in message.parts:
+                if part.part_kind == "user-prompt" and isinstance(part.content, list):
+                    if any(isinstance(item, BinaryContent) for item in part.content):
+                        state.pending_input, state.pending_images = images.restore_prompt(part.content)
+                        break
+            if state.pending_images:
+                break
         # 截断内存里的历史，并整体重写会话文件
         state.history = state.history[: cp.history_index]
         session.rewrite_messages(state.session_id, state.history)
         # 被截掉的对话对应的检查点不再有意义，丢弃
         fh.drop_from(cp)
         # 把被回退的那条输入回填到输入框，用户改一改就能重发
-        state.pending_input = cp.prompt
         # token 计数按剩下的历史重算，进程内的 API 调用记录清空，记忆允许再召回
         _recount_tokens(state)
         state.last_api_calls.clear()

@@ -141,7 +141,23 @@ Add-Content -Path app.log -Value "ERROR database connection refused" -Encoding u
 
 每个 monitor 固定 10 秒窗口最多接收 20 条，队列最多 200 条，单条事件截断到 500 字符；超额事件计数，通知携带 dropped。累计丢弃 100 条会自动停止。超时、退出、手动停止和过长行都通过事件通道说明，不再重复发送 task-notification。限流是每个 monitor 的保护，不能保证整个会话的上下文或日志磁盘总量有严格上限。
 
-实现链路：monitor 工具 → JobRegistry.spawn_monitor → stdout PIPE → _pump_monitor → pending_events → build_job_notifications → hook / watch_jobs → 主模型回答。详细解释见 [持续事件监控讲解](持续事件监控讲解.md)。
+实现链路：monitor 工具 → JobRegistry.spawn_monitor → stdout PIPE → _pump_monitor → pending_events → build_job_notifications → hook / watch_jobs → 主模型回答。
+
+## 图片输入
+
+按「接通图片输入」教程实现剪贴板、@ 图片、read_file 三条入口，支持 png/jpg/jpeg/gif/webp，沿用当前模型配置；服务端模型需要支持图像输入。
+
+- 复制图片后，Windows 输入区按 **Alt+V**；macOS/Linux 按 **Ctrl+V**。出现 `[Image #1]` 后输入问题，回车提交。普通文本粘贴仍用终端原来的快捷键。
+- 输入 `@assets/login.png 解释这个页面`，图片在引用位置直接作为附件；文本文件仍通过模拟 read_file 调用注入历史。路径与说明用空格分隔；@ 解析不支持含空格的路径。
+- 告诉 Agent 图片路径，让它调用 read_file；图片按图像返回，offset/limit 只用于文本。文件工具可以读取含空格的路径。
+
+`[Image #1] 这是什么？ [Image #2] 这个呢？` 转换为 `[图片1, 文本1, 图片2, 文本2]`，保留顺序。剪贴板和 @ 图片共用编号；删除占位符即不发送该粘贴图片，Esc 清空草稿及附件。提交后新草稿从 #1 编号；上下键只回填文本，重发旧截图需重新粘贴或 @ 引用。/rewind 会从所选轮次的多模态历史回填图片与文字。
+
+剪贴板图片保存到 `~/.my-claude-code/clipboard/`，每次独立 PNG。Windows 使用 PowerShell（STA），macOS 用 osascript，Linux 当前使用 X11/xclip，需要预先安装。缺少工具或没有图片时明确提示，可改用 @ 引用。系统取图移到工作线程，避免阻塞输入界面。
+
+三条入口最终都是 BinaryContent 原始字节与 MIME 类型，SDK 编码为 data URI，发送 Chat Completions 的 image_url 内容块。图片也随 JSONL 历史保存，/resume 无需原图片仍然存在。终端和 /api-detail 只显示类型/大小，会话列表提取用户文字。auto 分类器只取用户文字，不把图片内容当作授权。图片读取不登记到文本编辑状态，因此不会放开以文本覆盖二进制图片的检查。
+
+详细解释见 [图片输入讲解](图片输入讲解.md)。test_images.py 验证图文顺序、混合引用、工具返回、真实 SDK 请求映射（模拟 HTTP）、历史恢复、回退、剪贴板分支与模拟终端按键，不调用真实模型或改变真实剪贴板。
 
 ## 数据
 
@@ -149,6 +165,7 @@ Add-Content -Path app.log -Value "ERROR database connection refused" -Encoding u
 ~/.my-claude-code/
 ├── mcp.json
 ├── mcp-logs/
+├── clipboard/                  # 每次粘贴的 PNG；图片数据也随会话保存
 ├── jobs/<session_id>/<job_id>.log # 命令输出；注册表和进程状态只在内存中
 ├── tasks/<session_id>/           # 每条 task 一个 JSON
 └── projects/<项目路径编码>/

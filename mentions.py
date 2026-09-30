@@ -16,11 +16,12 @@ from pydantic_ai.messages import (
 
 from agent.file_state import ReadFileState
 from agent.tools import read_and_register
+import images
 
 # 匹配 @ 引用：要求 @ 前面是行首或空白，避免把 foo@bar.com 这种邮箱误判成引用
 # @ 后面跟一段路径常见字符（字母、数字、下划线、点、斜杠、反斜杠、连字符、波浪号），遇到空格或中文标点就停，不会把后面的句子也吞进来
 # 只支持纯路径 @path 的最简形态，不处理带引号路径、行号区间、@agent 等分支
-AT_MENTION_RE = re.compile(r"(?:^|\s)@([\w./~\\\-]+)")
+AT_MENTION_RE = re.compile(r"(?:^|\s)@([\w./~\\:\-]+)")
 
 
 def extract_at_mentions(text: str) -> list[str]:
@@ -35,7 +36,8 @@ def extract_at_mentions(text: str) -> list[str]:
     return seen
 
 
-def build_mention_messages(paths: list[str], state: ReadFileState) -> list:
+def build_mention_messages(paths: list[str], state: ReadFileState,
+                           attachments: list | None = None, image_paths: list | None = None) -> list:
     """
     把每个被 @ 的文件读出来，为它伪造一对 read_file 的 tool_call + tool_return，返回要塞进历史的消息列表。
     read_and_register 顺手把文件登记进 readFileState，和真正的 read_file 调用一模一样，之后 edit_file 就不会被拦。
@@ -45,6 +47,14 @@ def build_mention_messages(paths: list[str], state: ReadFileState) -> list:
         abs_path = os.path.abspath(os.path.expanduser(path))
         # 不存在的路径、目录都跳过，简化处理
         if not os.path.isfile(abs_path):
+            continue
+        if images.is_image(abs_path):
+            if attachments is not None and image_paths is not None:
+                try:
+                    attachments.append(images.load_image(abs_path))
+                    image_paths.append(path)
+                except (OSError, ValueError):
+                    continue
             continue
         try:
             numbered = read_and_register(state, abs_path)
@@ -66,6 +76,18 @@ def build_mention_messages(paths: list[str], state: ReadFileState) -> list:
             )
         )
     return messages
+
+
+def replace_image_mentions(text: str, image_paths: list[str], start_index: int = 1) -> str:
+    """保留引用位置；重复引用同一个文件共用图片编号，与粘贴图片衔接。"""
+    numbers = {path: start_index + i for i, path in enumerate(image_paths)}
+    def replace(match):
+        path = match.group(1)
+        if path not in numbers:
+            return match.group(0)
+        prefix = match.group(0)[:match.start(1) - match.start() - 1]
+        return prefix + f"[Image #{numbers[path]}]"
+    return AT_MENTION_RE.sub(replace, text)
 
 
 # 遍历目录时跳过的常见噪音目录：依赖、缓存、构建产物，列出来当文件候选没意义

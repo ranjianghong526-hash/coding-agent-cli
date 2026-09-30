@@ -2,6 +2,7 @@ import asyncio
 
 from pydantic_ai import Agent
 from pydantic_graph import End
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 import compact
 import mcp_servers
@@ -9,6 +10,9 @@ from legacy_migration import migrate_legacy_data
 import session
 from agent import agent, MODEL_NAME, api_call_log
 from agent.deps import AgentDeps
+from agent.reminders import build_job_reminder_text
+from background_jobs import JobRegistry
+from ui.render import print_job_finished
 from file_history import FileHistory
 from memory import background, recall, store
 from tasks_store import TasksStore
@@ -53,7 +57,8 @@ def apply_result(state, result):
     跑完一轮 Agent 后，把结果同步到 SessionState。
     """
     state.history = result.all_messages()
-    usage = result.usage()
+    # 当前 pydantic-ai 2.x 的 usage 是属性。
+    usage = result.usage
     state.input_tokens += usage.input_tokens
     state.output_tokens += usage.output_tokens
     state.last_api_calls = list(api_call_log)
@@ -92,6 +97,7 @@ async def run_agent_loop(user_input, state):
         read_file_state=state.read_file_state,
         tasks_store=state.tasks_store,
         file_history=state.file_history,
+        job_registry=state.job_registry,
     )
     async with agent.iter(
         user_input, message_history=state.history, deps=deps,
@@ -116,6 +122,17 @@ async def run_agent_loop(user_input, state):
     return run.result
 
 
+async def watch_jobs(state, repl, interval=1):
+    """仅扫描本地状态，不请求模型；空闲且 job 完成时才提交通知。"""
+    while True:
+        await asyncio.sleep(interval)
+        if repl.is_idle:
+            text = build_job_reminder_text(state.job_registry)
+            if text:
+                # 检查、领取、提交之间没有 await，避免与用户回车抢占。
+                repl.submit_system(text)
+
+
 async def main():
     migrated = migrate_legacy_data()
     if migrated["sessions"] or migrated["memories"]:
@@ -132,9 +149,11 @@ async def main():
         session_id=session_id,
         tasks_store=tasks_store,
         file_history=FileHistory(session_id=session_id),
+        job_registry=JobRegistry(session_id, print_job_finished),
     )
     print_welcome_banner("my-claude-code")
 
+    watcher = None
     try:
         # 转圈提示连接进度，否则冷启动拉包时用户会以为卡死了
         with console.status("正在连接 MCP server..."):
@@ -145,7 +164,17 @@ async def main():
         # 常驻输入区：输入框整个会话期间不消失。task 面板通过 state.tasks_store 拉数据，所以 /new、/resume 换会话时不需要重新接线
         repl = Repl(state)
 
-        async def on_submit(user_input):
+        async def on_submit(user_input, is_system=False):
+            if is_system:
+                await compact.auto_compact_if_needed(state)
+                notification = ModelRequest(parts=[UserPromptPart(user_input)],
+                                            metadata={"origin": "background-job-notification"})
+                state.history.append(notification)
+                session.append_messages(state.session_id, [notification])
+                repl.start_working()
+                # None 表示从已有通知历史继续，不再添加一条普通用户输入。
+                await run_agent_loop(None, state)
+                return
             # 每次回车提交一行输入，都走这里
             # 先处理 / 开头的命令
             action = await handle_command(user_input, state)
@@ -173,11 +202,18 @@ async def main():
             # 本轮结束后由后台提炼记忆，并顺带检查是否到了该定期合并的时候
             background.schedule(state, result.new_messages())
 
+        watcher = asyncio.create_task(watch_jobs(state, repl))
         await repl.run(on_submit)
     finally:
         # 后台任务和 MCP 连接在正常退出、启动失败、取消时都能收尾。
         try:
-            await background.drain()
+            if watcher:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+            try:
+                await state.job_registry.aclose()
+            finally:
+                await background.drain()
         finally:
             await mcp_servers.shutdown()
 

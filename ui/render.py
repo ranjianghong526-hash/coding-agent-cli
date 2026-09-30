@@ -13,6 +13,15 @@ from rich.text import Text
 console = Console(highlight=False)
 
 
+def print_job_finished(job) -> None:
+    console.print(f"● {job.summary()}（{job.id}）", markup=False)
+
+
+def print_system_text(text: str) -> None:
+    console.print("◇ system", style="dim")
+    console.print(text, markup=False, style="dim")
+
+
 def print_step(label: str, content: str = "") -> None:
     """
     打印一个中间过程 block：标签独占一行，内容用 Padding 左缩进 2 格

@@ -94,11 +94,13 @@ def first_prompt(path: Path) -> str:
             if not line:
                 break
             msg = json.loads(line)
+            if (msg.get("metadata") or {}).get("origin") in {"dynamic-reminder", "background-job-notification"}:
+                continue
             for part in msg.get("parts", []):
                 if part.get("part_kind") != "user-prompt":
                     continue
                 content = str(part.get("content", ""))
-                if content.startswith("<system-reminder>"):
+                if content.startswith(("<system-reminder>", "<task-notification>")):
                     continue
                 return content
     return "(空会话)"

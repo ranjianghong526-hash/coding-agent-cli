@@ -2,8 +2,26 @@
 system-reminder 正文构造。真正的注入在 agent/hooks.py 里挂 hook。
 """
 from tasks_store import TasksStore
+from html import escape
+from background_jobs import JobRegistry
 
 from .file_state import ReadFileState
+
+
+def build_job_reminder_text(registry: JobRegistry | None) -> str | None:
+    """领取已完成且未通知的后台 job；领取后标记，活跃/空闲链路不会重复发送。"""
+    jobs = registry.pop_unnotified() if registry else []
+    if not jobs:
+        return None
+    blocks = []
+    for job in jobs:
+        fields = {"task-id": job.id, "task-type": job.kind,
+                  "output-file": str(job.log_path), "status": job.status,
+                  "summary": job.summary() + "。请读取日志了解结果，再继续原任务。"}
+        # 命令里可能有 <、>，转义后不能伪造通知标签。
+        body = "\n".join(f"<{key}>{escape(value)}</{key}>" for key, value in fields.items())
+        blocks.append(f"<task-notification>\n{body}\n</task-notification>")
+    return "\n".join(blocks)
 
 
 def _wrap(lines: list[str]) -> str:

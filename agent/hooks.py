@@ -16,10 +16,10 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, User
 
 import classifier
 import permissions
-from ui.render import console, print_step
+from ui.render import console, print_step, print_system_text
 
 from .deps import AgentDeps
-from .reminders import build_reminder_text, build_task_reminder_text
+from .reminders import build_reminder_text, build_task_reminder_text, build_job_reminder_text
 
 
 MAX_RETRIES = 3
@@ -146,7 +146,11 @@ _REMINDER_SENTINELS = {
     # task reminder 的识别串就是它正文里 builder 必定带的那句话，不再单独嵌一个 marker
     "task": "task 工具最近没有被使用",
 }
-_REMINDER_BUILDERS = (_build_file_reminder, _build_task_reminder)
+def _build_job_reminder(ctx, messages):
+    return build_job_reminder_text(ctx.deps.job_registry)
+
+
+_REMINDER_BUILDERS = (_build_file_reminder, _build_task_reminder, _build_job_reminder)
 
 
 @hooks.on.before_model_request
@@ -160,8 +164,9 @@ async def _inject_reminders(ctx, request_context):
         text = builder(ctx, messages + appended)
         if text is None:
             continue
-        appended.append(ModelRequest(parts=[UserPromptPart(content=text)]))
-        print_step("[dim]◇ system[/]", f"[dim]{text[:200]}[/]")
+        appended.append(ModelRequest(parts=[UserPromptPart(content=text)],
+                                     metadata={"origin": "dynamic-reminder"}))
+        print_system_text(text)
     if not appended:
         return request_context
     return dataclasses.replace(request_context, messages=messages + appended)

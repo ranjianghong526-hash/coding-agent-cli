@@ -22,9 +22,10 @@ import permissions
 import session
 from agent import ReadFileState
 from file_history import FileHistory
+from background_jobs import JobRegistry
 from memory import background, store
 from tasks_store import TasksStore
-from .render import console, print_step, print_welcome_banner
+from .render import console, print_step, print_welcome_banner, print_job_finished
 
 
 class LeftAlignedHeading(Heading):
@@ -66,6 +67,8 @@ class SessionState:
     pending_input: str = ""
     # 自动压缩连续失败的次数，达到上限后不再重试
     compact_failures: int = 0
+    # 只管理本次运行中的进程；日志保留在磁盘，恢复会话不会重启旧命令。
+    job_registry: JobRegistry | None = None
 
 
 @dataclass
@@ -235,7 +238,9 @@ def print_agent_steps(new_messages) -> None:
             print_part(part)
 
 
-def cmd_exit(state: SessionState) -> bool:
+async def cmd_exit(state: SessionState) -> bool:
+    if state.job_registry:
+        await state.job_registry.aclose()
     console.print("再见 👋")
     return False
 
@@ -248,16 +253,19 @@ def cmd_help(state: SessionState) -> bool:
     return True
 
 
-def cmd_new(state: SessionState) -> bool:
+async def cmd_new(state: SessionState) -> bool:
     """
     开启新会话：清空历史、token 计数、API 调用记录，换一个新的会话 ID。
     """
+    if state.job_registry:
+        await state.job_registry.aclose()
     state.history.clear()
     state.input_tokens = 0
     state.output_tokens = 0
     state.last_api_calls.clear()
     state.compact_failures = 0
     state.session_id = session.new_session_id()
+    state.job_registry = JobRegistry(state.session_id, print_job_finished)
     # 权限白名单是会话级的，「本会话不再询问」不该带进新会话
     permissions.state.session_allowed.clear()
     # readFileState 也是会话级的，新会话从空白开始，旧会话读过的文件不带进来
@@ -323,8 +331,12 @@ async def cmd_resume(state: SessionState) -> bool:
         return True
 
     # 还原对话历史，并把会话 ID 切换成选中的旧会话，后续消息继续追加到同一个文件
-    state.history = session.load_history(selected)
+    history = session.load_history(selected)
+    if state.job_registry:
+        await state.job_registry.aclose()
+    state.history = history
     state.session_id = selected
+    state.job_registry = JobRegistry(selected, print_job_finished)
     # 权限白名单是会话级的，切换会话后清空
     permissions.state.session_allowed.clear()
     # readFileState 也是会话级的，切换会话后换上新实例。恢复的历史里虽有读取痕迹，但进程退出后文件可能已变、mtime 不再可信，让模型恢复后首次编辑重读一次更稳
@@ -681,7 +693,17 @@ def cmd_api_detail(state: SessionState) -> bool:
     return True
 
 
+def cmd_jobs(state: SessionState) -> bool:
+    jobs = state.job_registry.list() if state.job_registry else []
+    if not jobs:
+        console.print("(当前会话没有 job)")
+    for job in jobs:
+        console.print(f"{job.id}  [{job.status}]  {job.description}\n  日志：{job.log_path}", markup=False)
+    return True
+
+
 COMMANDS = {
+    "jobs": Command("jobs", "查看当前会话的命令及日志", cmd_jobs),
     "new": Command("new", "开启新会话", cmd_new),
     "resume": Command("resume", "恢复历史会话", cmd_resume),
     "rewind": Command("rewind", "回退到之前的检查点", cmd_rewind),

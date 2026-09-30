@@ -179,7 +179,7 @@ class ProjectTests(unittest.IsolatedAsyncioTestCase):
         read_file(self.ctx, str(path))
         sid = self.state.session_id
         result = SimpleNamespace(output='<analysis>草稿</analysis><summary>摘要正文</summary>',
-                                 usage=lambda: SimpleNamespace(input_tokens=10, output_tokens=3))
+                                 usage=SimpleNamespace(input_tokens=10, output_tokens=3))
         with patch.object(compact.summarizer, 'run', AsyncMock(return_value=result)):
             await compact.run_compact(self.state)
         self.assertEqual(self.state.session_id, sid)

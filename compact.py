@@ -136,7 +136,7 @@ async def run_compact(state, custom_instructions: str = "") -> None:
     summary = extract_summary(result.output)
 
     # 压缩调用本身的开销也计入会话累计
-    usage = result.usage()
+    usage = result.usage
     state.input_tokens += usage.input_tokens
     state.output_tokens += usage.output_tokens
 

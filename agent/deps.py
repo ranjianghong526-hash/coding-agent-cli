@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from file_history import FileHistory
 from tasks_store import TasksStore
+from background_jobs import JobRegistry
 
 from .file_state import ReadFileState
 
@@ -16,3 +17,5 @@ class AgentDeps:
     tasks_store: TasksStore | None
     # 文件检查点，写文件的工具用它备份改动前内容；默认 None，后台记忆 fork 写的记忆文件不进回退范围
     file_history: FileHistory | None = None
+    # 后台记忆 fork 不执行命令，因此可以不挂注册表。
+    job_registry: JobRegistry | None = None

@@ -20,7 +20,7 @@ from rich.markup import escape
 
 import permissions
 from mentions import list_candidate_files
-from .render import console
+from .render import console, print_system_text
 
 # 常驻输入区：输入框整个会话期间挂在屏幕底部不消失，Agent 输出通过 patch_stdout 打印在它上方，请求期间按 ESC / Ctrl+C 能立刻打断。
 
@@ -61,6 +61,7 @@ class Repl:
         self._on_submit = None
         # 当前处理输入的后台任务，ESC / Ctrl+C 据此打断；None 表示空闲
         self._task = None
+        self._exiting = False
         # 是否正在请求模型，决定上方 working... 指示器的显隐
         self.working = False
         self._work_start = 0.0
@@ -94,7 +95,9 @@ class Repl:
     def _mode_line(self):
         # 输入框下方那行：当前权限模式 + 切换提示
         mode = permissions.state.mode
-        return HTML(f"  <ansimagenta><b>▶▶ {mode}</b></ansimagenta><ansibrightblack>（Shift+Tab 切换）</ansibrightblack>")
+        registry = self.state.job_registry
+        count = sum(job.background for job in registry.running()) if registry else 0
+        return HTML(f"  <ansimagenta><b>▶▶ {mode}</b></ansimagenta><ansibrightblack>（Shift+Tab 切换 · Ctrl+B 转后台 · 后台 {count}）</ansibrightblack>")
 
     def _divider(self):
         # 一条横向分割线
@@ -180,6 +183,14 @@ class Repl:
             # 循环切换权限模式
             permissions.cycle_mode()
 
+        @kb.add("c-b")
+        def _(event):
+            registry = self.state.job_registry
+            jobs = registry.background_foreground() if registry else []
+            if jobs:
+                console.print("已转后台：" + ", ".join(job.id for job in jobs), markup=False)
+            event.app.invalidate()
+
         return kb
 
     def _on_enter(self):
@@ -210,10 +221,25 @@ class Repl:
         console.print(f"[bright_black]{rule}[/]")
         console.print()
 
-    async def _process(self, text):
+    @property
+    def is_idle(self):
+        return self._task is None and not self._exiting and self._on_submit is not None
+
+    def submit_system(self, text) -> bool:
+        """提交系统通知；保留用户尚未发送的草稿，不回显成用户输入。"""
+        if not self.is_idle:
+            return False
+        print_system_text(text)
+        self._task = self.app.create_background_task(self._process(text, is_system=True))
+        return True
+
+    async def _process(self, text, is_system=False):
         # 后台任务：交给 on_submit，统一兜住打断和异常
         try:
-            await self._on_submit(text)
+            if is_system:
+                await self._on_submit(text, is_system=True)
+            else:
+                await self._on_submit(text)
         except asyncio.CancelledError:
             console.print("\n[bold yellow]已中断[/]\n")
         except Exception as e:
@@ -236,6 +262,7 @@ class Repl:
 
     def exit(self):
         # 结束常驻输入区（/exit 命令用）
+        self._exiting = True
         self.app.exit()
 
     async def run(self, on_submit):
@@ -248,7 +275,9 @@ class Repl:
             with patch_stdout(raw=True):
                 await self.app.run_async()
         finally:
+            self._exiting = True
             ticker.cancel()
+            await asyncio.gather(ticker, return_exceptions=True)
 
     async def _tick(self):
         try:
@@ -256,6 +285,6 @@ class Repl:
                 await asyncio.sleep(0.1)
                 if self.working:
                     self._frame += 1
-                    self.app.invalidate()
+                self.app.invalidate()
         except asyncio.CancelledError:
             pass

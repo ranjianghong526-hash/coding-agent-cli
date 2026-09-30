@@ -67,6 +67,11 @@ def build_transcript(messages, tool_name: str, args: dict) -> str:
         for part in message.parts:
             # 用户消息：part_kind 是 user-prompt，content 是用户输入的文本
             if part.part_kind == "user-prompt":
+                # SDK 的 user-prompt 也承载程序提醒；它们不能算作用户授权。
+                if (getattr(message, "metadata", None) or {}).get("origin") in {
+                    "dynamic-reminder", "background-job-notification"
+                } or str(part.content).startswith(("<system-reminder>", "<task-notification>")):
+                    continue
                 lines.append(json.dumps({"user": str(part.content)}, ensure_ascii=False))
             # 工具调用：记下工具名和参数，让 classifier 看到 agent 一路做过什么
             elif part.part_kind == "tool-call":

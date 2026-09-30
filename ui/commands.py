@@ -1,24 +1,29 @@
-"""会话状态、斜杠命令和消息展示的协调层。
-
-阅读时分三组：SessionState/Command 定义数据；print_* 展示消息；cmd_* 处理命令。
-COMMANDS 注册表供 main.py 查找命令，本模块不直接向大模型发送请求。
-"""
-
+import difflib
+import os
+import time
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Optional
-from uuid import uuid4
+from datetime import datetime
+from typing import Callable, Optional
 
-from prompt_toolkit import PromptSession
-from session_store import list_sessions, load_session, save_session
-from permissions import PermissionState
-
+import questionary
+from prompt_toolkit.application import Application, in_terminal
+from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.styles import Style
 from rich.markdown import Heading, Markdown
 from rich.markup import escape
 from rich.padding import Padding
-from rich.rule import Rule
 
-# 复用底层渲染对象；render.py 不依赖 commands.py，保持依赖方向清晰。
-# print_welcome_banner 在这里导入后，也可以由 main.py 从本模块取到。
+import compact
+import mcp_servers
+import permissions
+import session
+from agent import ReadFileState
+from file_history import FileHistory
+from memory import background, store
+from tasks_store import TasksStore
 from .render import console, print_step, print_welcome_banner
 
 
@@ -27,14 +32,12 @@ class LeftAlignedHeading(Heading):
     rich 默认把 Markdown 标题渲染成居中对齐，宽终端里看着像错位，覆盖成左对齐。
     """
     def __rich_console__(self, console, options):
-        """实现 Rich 的渲染协议，用 yield 提供要输出的左对齐标题对象。"""
         text = self.text
         text.justify = "left"
         yield text
 
 
 # 全局替换 Markdown 的标题渲染元素
-# 模块被导入后，这个替换会影响同一进程中后续的 Rich Markdown 标题。
 Markdown.elements["heading_open"] = LeftAlignedHeading
 
 
@@ -43,60 +46,44 @@ class SessionState:
     """
     跨命令共享的会话状态，主循环把它传给每个命令处理函数。
     """
-    # 每份会话拥有独立列表，保存用户、模型及工具之间的完整消息历史。
     history: list = field(default_factory=list)
-    # 累计计数由 main.apply_result() 在每轮结束后更新，/new 将它们归零。
     input_tokens: int = 0
     output_tokens: int = 0
-    # 只用于展示当前配置的模型名，不在这里切换模型。
     model_name: str = ""
+    # 当前会话 ID，决定对话历史写入哪个 jsonl 文件
+    session_id: str = ""
     # 最近一轮 user input 触发的所有 model API 调用记录
     last_api_calls: list = field(default_factory=list)
-    # 每个新会话使用独立文件；saved_messages 标记已成功落盘的消息数量。
-    session_id: str = field(default_factory=lambda: uuid4().hex)
-    saved_messages: int = 0
-    # 回退后把被撤销轮次的原话放回输入区，用户可编辑后重新提交。
-    next_prompt: str = ""
-    # 自动压缩连续失败后停止；手动压缩仍可尝试，成功后归零。
+    # 本会话的 readFileState，注入给文件工具；切换会话时换上新实例
+    read_file_state: ReadFileState = field(default_factory=ReadFileState)
+    # 本会话的 TasksStore，注入给 task 工具；落盘在 ~/.my-claude-code/tasks/<session_id>/，所以必须由 main 显式构造传入
+    tasks_store: TasksStore | None = None
+    # 本会话已召回注入过的记忆文件名，同一条记忆不重复注入
+    surfaced_memories: set = field(default_factory=set)
+    # 本会话的文件检查点，/rewind 靠它回退文件和对话；由 main 构造传入
+    file_history: FileHistory | None = None
+    # /rewind 回退对话后待回填输入框的原 prompt，Repl 在命令结束后消费
+    pending_input: str = ""
+    # 自动压缩连续失败的次数，达到上限后不再重试
     compact_failures: int = 0
-    # 权限属于当前程序运行，/new 和 /resume 不重置，也不从 JSONL 恢复授权。
-    permissions: PermissionState = field(default_factory=PermissionState)
-
-    def __post_init__(self):
-        # deps 中的任务存储与聊天会话使用相同编号，避免串到其他会话。
-        self.permissions.tasks.bind(self.session_id)
-        self.permissions.rewind.bind(self.session_id)
 
 
 @dataclass
 class Command:
-    """把命令名、帮助文本和处理函数放在一起，供注册表统一管理。"""
-    # name 不带 /；description 是 /help 中显示的说明。
     name: str
     description: str
     # handler 返回 False 表示主循环应当退出
-    # Callable 描述函数类型；引号中的 SessionState 是类型名称的字符串写法。
-    # /resume 需要异步等待选择，其他命令仍可直接返回 bool。
-    handler: Callable[..., bool | Awaitable[bool]]
+    handler: Callable[..., bool]
+    # 是否接收命令名后面的参数串（如 /compact 的补充指令）
     takes_args: bool = False
-
-
-def print_divider() -> None:
-    """
-    每轮交互之前打印一条分割线，区分输入区域。Rule 会自适应终端宽度。
-    """
-    console.print(Rule(style="grey50"))
 
 
 def _truncate(text, limit: int = 120) -> str:
     """
     截断并 escape，用于 tool 参数 / 返回值 / 用户输入这类可能过长的内容。
     """
-    # 内容可能不是字符串，先转换后去掉首尾空白，再按字符数截断。
-    # 截断仅影响展示，不会改变保存的原始消息和实际工具执行结果。
     text = str(text).strip()
     text = text if len(text) <= limit else text[:limit] + "..."
-    # Rich 用 [green] 等标签控制样式；转义用户内容，避免其中的方括号变成样式。
     return escape(text)
 
 
@@ -104,7 +91,6 @@ def _full(text) -> str:
     """
     完整显示，只做 escape 不截断，用于 thinking 和 assistant text 这种用户关心的内容。
     """
-    # 这里处理的是 Rich markup；最终回复的 Markdown 渲染走另一个函数。
     return escape(str(text).strip())
 
 
@@ -114,12 +100,10 @@ def _format_part_line(part) -> Optional[str]:
     版式：图标 + role 标签独占一行，内容换行到下一行，不用「|」分隔。
     """
     # 内容行统一缩进 2 格，和图标（占 2 格：图标 + 空格）后的 role 名对齐
-    # 每种 part 需要不同的标签和取值字段，不同于只按 user / assistant 分类。
     kind = part.part_kind
     if kind == "user-prompt":
         return f"[cyan]❯ user[/]\n  {_truncate(part.content)}"
     if kind == "thinking":
-        # 只有模型响应实际提供 thinking 片段时才显示，并非自行推测模型思考。
         # thinking 整块 dim，弱化视觉权重；不截断，完整保留思考过程
         return f"[dim]✻ thinking[/]\n  [dim]{_full(part.content)}[/]"
     if kind == "text":
@@ -129,16 +113,14 @@ def _format_part_line(part) -> Optional[str]:
         # assistant 是用户最关心的最终回答，完整显示
         return f"[green]● assistant[/]\n  {_full(content)}"
     if kind == "tool-call":
-        # 显示模型请求执行的工具名和参数，这个格式化函数本身不执行工具。
         # 命令、路径动辄上百字符，参数放宽到 500 字符再截断
         return f"[yellow]⏺ tool_call[/]\n  [yellow dim]{part.tool_name}({_truncate(part.args, 500)})[/]"
     if kind == "tool-return":
-        # 工具返回结果是下一次模型判断的依据，这里只显示摘要。
+        # 工具成功返回，标签用 ✔
         return f"[magenta]✔ tool_return[/]\n  [magenta dim]{part.tool_name} -> {_truncate(part.content)}[/]"
     if kind == "retry-prompt":
-        # 工具抛 ModelRetry 后，SDK 生成 retry-prompt 把错误反馈给模型
+        # 工具抛 ModelRetry 后，SDK 生成 retry-prompt 把错误反馈给模型，标签用 ✘ 表示这次调用失败
         return f"[yellow]✘ tool_retry[/]\n  [yellow dim]{part.tool_name} -> {_truncate(part.content)}[/]"
-    # 尚未支持的片段类型跳过显示；消息仍保留在会话历史中。
     return None
 
 
@@ -146,17 +128,83 @@ def print_assistant_markdown(content: str) -> None:
     """
     模型的回复天然是 Markdown 格式，整块渲染出来，而不是打印原始文本。
     """
-    # 先打印角色，再将回复中的标题、列表、代码块交给 Markdown 对象处理。
     console.print("[green]● assistant[/]")
     # Markdown 是块级渲染对象，没法跟在行内前缀后面，所以另起一行渲染；左缩进 2 格和 role 名对齐
     console.print(Padding(Markdown(content), (0, 0, 0, 2)))
 
 
+# read / write 内容预览最多显示的行数，超出的折叠成「… +N 行」
+_PREVIEW_MAX_LINES = 8
+
+
+def _preview_numbered(content: str) -> Optional[str]:
+    """
+    把内容加绿色行号、截断成预览，用于 write_file 的写入内容展示。
+    """
+    lines = content.splitlines()
+    if not lines:
+        return None
+    width = len(str(len(lines)))
+    shown = lines[:_PREVIEW_MAX_LINES]
+    out = [f"  [green]{i:>{width}}[/] {escape(ln)}" for i, ln in enumerate(shown, 1)]
+    if len(lines) > _PREVIEW_MAX_LINES:
+        out.append(f"  [dim]… +{len(lines) - _PREVIEW_MAX_LINES} 行[/]")
+    return "\n".join(out)
+
+
+def _preview_diff(old: str, new: str) -> str:
+    """
+    用 difflib 把 old -> new 渲染成红绿 diff：删除行红、新增行绿、不变行 dim。
+    """
+    out = []
+    for line in difflib.ndiff(old.splitlines(), new.splitlines()):
+        tag, body = line[:2], escape(line[2:])
+        if tag == "- ":
+            out.append(f"  [red]- {body}[/]")
+        elif tag == "+ ":
+            out.append(f"  [green]+ {body}[/]")
+        elif tag == "  ":
+            out.append(f"  [dim]  {body}[/]")
+        # "? " 是 difflib 的字符级提示行，跳过不显示
+    return "\n".join(out)
+
+
+def _print_file_op(part) -> bool:
+    """
+    文件工具的富展示：edit 红绿 diff、write 带行号写入预览、read 带行号读取结果。返回 True 表示已处理。
+    """
+    # 这里按工具名特判，没像 permissions 那样建注册表：展示逻辑依赖 rich，若让工具层注册渲染器，agent 层就会反向依赖 UI 层，得不偿失
+    kind = part.part_kind
+    if kind == "tool-call" and part.tool_name in ("edit_file", "write_file"):
+        args = part.args_as_dict()
+        path = escape(str(args.get("path", "")))
+        # edit / write 的标签行与「工具名(路径)」内容行格式一致，统一打印，只有下方的预览不同
+        console.print("[yellow]⏺ tool_call[/]")
+        console.print(Padding(f"[yellow dim]{part.tool_name}({path})[/]", (0, 0, 0, 2)))
+        if part.tool_name == "edit_file":
+            console.print(_preview_diff(args.get("old_string", ""), args.get("new_string", "")))
+        else:
+            block = _preview_numbered(args.get("content", ""))
+            if block:
+                console.print(block)
+        return True
+    if kind == "tool-return" and part.tool_name == "read_file":
+        # read_file 的返回已经是带行号的内容，按行截断预览
+        console.print("[magenta]✔ tool_return[/]")
+        console.print(Padding("[magenta dim]read_file[/]", (0, 0, 0, 2)))
+        lines = str(part.content).splitlines()
+        for ln in lines[:_PREVIEW_MAX_LINES]:
+            console.print(f"  [dim]{escape(ln)}[/]")
+        if len(lines) > _PREVIEW_MAX_LINES:
+            console.print(f"  [dim]… +{len(lines) - _PREVIEW_MAX_LINES} 行[/]")
+        return True
+    return False
+
+
 def print_part(part) -> None:
     """
-    渲染单个消息 part：assistant 文本走 Markdown 块渲染，其余 part 是单行文本。
+    渲染单个消息 part：assistant 文本走 Markdown，文件操作走富展示，其余 part 是单行文本。
     """
-    # 正文单独走 Markdown；工具参数等内容使用转义后的普通文本。
     if part.part_kind == "text":
         content = (part.content or "").strip()
         if content:
@@ -164,7 +212,10 @@ def print_part(part) -> None:
             # 每个 role block 末尾留一个空行，块与块之间不那么挤
             console.print()
         return
-    # None 表示不支持或无需展示的内容；有文本时再拆成标签和正文。
+    # 文件工具（read / edit / write）走专门的富展示
+    if _print_file_op(part):
+        console.print()
+        return
     line = _format_part_line(part)
     if line:
         label, _, body = line.partition("\n")
@@ -176,8 +227,6 @@ def print_agent_steps(new_messages) -> None:
     """
     主循环里调用：显示这一轮 Agent 新增的中间过程（thinking、文本、工具调用、工具返回）。
     """
-    # 两层遍历分别处理消息和消息中的内容片段，顺序沿用框架返回的历史顺序。
-    # 这是已有消息的批量展示辅助函数；实时执行由 main.run_agent() 调用 print_part()。
     for msg in new_messages:
         for part in msg.parts:
             # 主循环里不重复显示用户刚刚输入的内容
@@ -187,16 +236,13 @@ def print_agent_steps(new_messages) -> None:
 
 
 def cmd_exit(state: SessionState) -> bool:
-    """输出告别文字，并通过 False 通知 main.py 结束输入循环。"""
     console.print("再见 👋")
     return False
 
 
 def cmd_help(state: SessionState) -> bool:
-    """从注册表生成帮助列表，新增注册项会自动出现在这里。"""
     console.print("可用命令：")
     for cmd in COMMANDS.values():
-        # :<10 表示宽度至少 10 个字符、左对齐，让说明的起始位置更整齐。
         console.print(f"  /{cmd.name:<10} {cmd.description}")
     console.print()
     return True
@@ -204,196 +250,406 @@ def cmd_help(state: SessionState) -> bool:
 
 def cmd_new(state: SessionState) -> bool:
     """
-    开启新会话：清空历史、token 计数、API 调用记录。
+    开启新会话：清空历史、token 计数、API 调用记录，换一个新的会话 ID。
     """
-    # 切换前补存尚未写入的历史；失败则不清空状态，避免丢失可继续保存的内容。
-    save_session(state)
-    new_id = uuid4().hex
-    # 先校验检查点，再切换任务；避免损坏日志造成半次会话切换。
-    from rewind_store import RewindStore
-    new_rewind = RewindStore(state.permissions.rewind.root)
-    new_rewind.bind(new_id)
-    state.permissions.tasks.bind(new_id)
-    state.permissions.rewind = new_rewind
-    # 只切换当前会话，旧 JSONL 文件和工具写入的文件都保留。
     state.history.clear()
     state.input_tokens = 0
     state.output_tokens = 0
     state.last_api_calls.clear()
-    state.session_id = new_id
-    state.saved_messages = 0
-    state.next_prompt = ""
     state.compact_failures = 0
-    state.permissions.files.clear()
+    state.session_id = session.new_session_id()
+    # 权限白名单是会话级的，「本会话不再询问」不该带进新会话
+    permissions.state.session_allowed.clear()
+    # readFileState 也是会话级的，新会话从空白开始，旧会话读过的文件不带进来
+    state.read_file_state = ReadFileState()
+    # TasksStore 按会话隔离落盘（~/.my-claude-code/tasks/<session_id>/），换会话同时换一份新的，task 面板会在下一次重绘时反映新 store
+    state.tasks_store = TasksStore(session_id=state.session_id)
+    # 召回去重集合是会话级的，新会话里旧记忆可以重新被召回
+    state.surfaced_memories = set()
+    # 文件检查点也按会话隔离，新会话从零开始记
+    state.file_history = FileHistory(session_id=state.session_id)
     console.print("已开启新会话\n")
     return True
 
 
+def _one_line(text, limit: int = 50) -> str:
+    """
+    压掉空白折成一行并截断；给 prompt_toolkit 用的纯文本，不做 Rich escape。
+    """
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _summary_line(mtime, prompt: str) -> str:
+    """
+    拼一条会话列表的展示文本：修改时间 + 首条用户输入摘要。
+    """
+    return f"{mtime:%m-%d %H:%M}  {_one_line(prompt)}"
+
+
+def _recount_tokens(state: SessionState) -> None:
+    """
+    按对话历史重算会话的 token 用量，每条模型回复都带 usage。
+    历史被整体替换的地方调用（/resume 恢复历史、/rewind 截断历史）。
+    """
+    state.input_tokens = sum(
+        m.usage.input_tokens for m in state.history if m.kind == "response"
+    )
+    state.output_tokens = sum(
+        m.usage.output_tokens for m in state.history if m.kind == "response"
+    )
+
+
+async def cmd_resume(state: SessionState) -> bool:
+    """
+    列出当前项目的历史会话，选中后恢复对话历史。
+    它跑在 REPL 的事件循环里，所以是异步的：in_terminal 把终端让给 questionary，结束后再恢复输入框。
+    """
+    sessions = session.list_sessions()
+    if not sessions:
+        console.print("(当前项目还没有历史会话)\n")
+        return True
+
+    choices = [
+        questionary.Choice(title=_summary_line(mtime, prompt), value=sid)
+        for sid, mtime, prompt in sessions
+    ]
+    async with in_terminal():
+        selected = await questionary.select(
+            "选择要恢复的会话（上下键移动，回车确认）：", choices=choices
+        ).ask_async()
+    # 用户按 Ctrl+C 取消选择
+    if selected is None:
+        return True
+
+    # 还原对话历史，并把会话 ID 切换成选中的旧会话，后续消息继续追加到同一个文件
+    state.history = session.load_history(selected)
+    state.session_id = selected
+    # 权限白名单是会话级的，切换会话后清空
+    permissions.state.session_allowed.clear()
+    # readFileState 也是会话级的，切换会话后换上新实例。恢复的历史里虽有读取痕迹，但进程退出后文件可能已变、mtime 不再可信，让模型恢复后首次编辑重读一次更稳
+    state.read_file_state = ReadFileState()
+    # TasksStore 指向当前 session_id 的目录，恢复时直接接上旧 task 列表（每个 task 是独立 JSON，已经落盘）
+    state.tasks_store = TasksStore(session_id=state.session_id)
+    # 召回去重集合从空集重新开始：恢复的历史里已注入的记忆可能被再召回一次，重复一次无伤大雅
+    state.surfaced_memories = set()
+    # 文件检查点随会话恢复：构造函数会加载该会话落盘的 checkpoints.json，旧检查点直接可用
+    state.file_history = FileHistory(session_id=state.session_id)
+
+    # 把恢复的会话的 token 用量累加回来
+    _recount_tokens(state)
+    # 最近一轮的 API 调用记录只在进程内有效，没法恢复，清空
+    state.last_api_calls.clear()
+    state.compact_failures = 0
+
+    # 把恢复的对话回放到屏幕上
+    console.print(f"\n已恢复会话 {selected[:8]}，共 {len(state.history)} 条消息：\n")
+    for msg in state.history:
+        for part in msg.parts:
+            # 回放和实时输出共用同一套 part 渲染逻辑
+            print_part(part)
+    console.print()
+    return True
+
+
+# rewind picker 的配色：当前项蓝色高亮，描述与 footer 弱化，增删行数绿/红
+_PICKER_STYLE = Style.from_dict({
+    "question": "bold",
+    "label-current": "#3b82f6 bold",
+    "label": "",
+    "desc": "#6b7280",
+    "plus": "#10b981",
+    "minus": "#ef4444",
+    "footer": "#6b7280",
+})
+
+
+class _ListPicker:
+    """
+    手绘单选 picker，每个选项可以带一行弱化的描述，视觉对齐权限审批的 picker。
+    """
+
+    def __init__(self, question: str, options: list, header: list | None = None):
+        # options 是 (value, label, desc) 列表；desc 是 FormattedText 片段列表，None 表示没有描述行
+        self.question = question
+        self.options = options
+        # header 是渲染在问句和选项之间的 FormattedText 片段
+        self.header = header
+        self.cursor = 0
+        # 选中项的 value；Esc / Ctrl+C 取消时保持 None
+        self.result = None
+        self.app = self._build_app()
+
+    def _render_question(self):
+        return FormattedText([("class:question", self.question)])
+
+    def _render_header(self):
+        return FormattedText(self.header)
+
+    def _render_options(self):
+        lines: list[tuple[str, str]] = []
+        for i, (_value, label, desc) in enumerate(self.options):
+            is_cursor = (i == self.cursor)
+            pointer = "❯" if is_cursor else " "
+            cls_label = "class:label-current" if is_cursor else "class:label"
+            lines.append((cls_label, f" {pointer}  {i + 1}. {label}"))
+            lines.append(("", "\n"))
+            if desc:
+                # 描述行缩进到与 label 文字对齐
+                lines.append(("", "       "))
+                lines.extend(desc)
+                lines.append(("", "\n"))
+        return FormattedText(lines)
+
+    def _render_footer(self):
+        return FormattedText([("class:footer", "  ↑↓ 选择 · Enter 确认 · Esc 取消")])
+
+    def _move(self, delta: int):
+        self.cursor = (self.cursor + delta) % len(self.options)
+
+    def _build_app(self) -> Application:
+        kb = KeyBindings()
+
+        @kb.add("up")
+        @kb.add("k")
+        def _(event):
+            self._move(-1)
+
+        @kb.add("down")
+        @kb.add("j")
+        def _(event):
+            self._move(1)
+
+        @kb.add("enter")
+        def _(event):
+            self.result = self.options[self.cursor][0]
+            self.app.exit()
+
+        @kb.add("escape")
+        @kb.add("c-c")
+        def _(event):
+            self.app.exit()
+
+        windows = [
+            Window(FormattedTextControl(self._render_question), height=1, always_hide_cursor=True),
+            Window(FormattedTextControl(self._render_options), dont_extend_height=True, always_hide_cursor=True),
+            Window(FormattedTextControl(self._render_footer), height=1, always_hide_cursor=True),
+        ]
+        if self.header:
+            windows.insert(1, Window(
+                FormattedTextControl(self._render_header),
+                dont_extend_height=True, always_hide_cursor=True,
+            ))
+        layout = Layout(HSplit(windows))
+        return Application(
+            layout=layout,
+            key_bindings=kb,
+            style=_PICKER_STYLE,
+            full_screen=False,
+            mouse_support=False,
+            # 选完擦掉整个 picker，滚动区里不留下选项
+            erase_when_done=True,
+        )
+
+    async def run(self):
+        await self.app.run_async()
+        return self.result
+
+
+def _age_text(timestamp: float) -> str:
+    """
+    把时间戳转成「14 分钟前」这样的相对时间。
+    """
+    seconds = max(0, time.time() - timestamp)
+    if seconds < 60:
+        return "刚刚"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} 分钟前"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} 小时前"
+    return f"{int(seconds // 86400)} 天前"
+
+
+def _changes_headline(changes) -> tuple:
+    """
+    把 FileChange 清单压成 (名称, 增行, 删行)：单个文件显示文件名，多个文件显示个数。
+    """
+    plus = sum(c.insertions for c in changes)
+    minus = sum(c.deletions for c in changes)
+    if len(changes) == 1:
+        name = os.path.basename(changes[0].path)
+    else:
+        name = f"{len(changes)} 个文件"
+    return name, plus, minus
+
+
+def _changes_fragments(changes) -> list:
+    """
+    把 FileChange 清单渲染成 picker 的描述片段：「main.py +12 -3」或「无代码改动」。
+    """
+    if not changes:
+        return [("class:desc", "无代码改动")]
+    name, plus, minus = _changes_headline(changes)
+    return [
+        ("class:desc", f"{name} "),
+        ("class:plus", f"+{plus}"),
+        ("class:minus", f" -{minus}"),
+    ]
+
+
+async def cmd_rewind(state: SessionState) -> bool:
+    """
+    回退到过去的某个检查点：先选检查点，再选回退对话、回退代码，还是两者都回退。
+    """
+    fh = state.file_history
+    if fh is None or not fh.checkpoints:
+        console.print("(暂无可回退的检查点，每条消息发出时会自动创建检查点)\n")
+        return True
+
+    # 检查点从新到旧排列，每条下面标注那一轮对话产生的改动量
+    cps = list(reversed(fh.checkpoints))
+    options = [
+        (i, _one_line(s.prompt), _changes_fragments(fh.turn_stats(s)))
+        for i, s in enumerate(cps)
+    ]
+    async with in_terminal():
+        picked = await _ListPicker("回退到哪条消息之前：", options).run()
+    if picked is None:
+        return True
+    cp = cps[picked]
+    # 确认信息展示累计代价：从当前状态回到检查点要撤销的全部改动
+    plan = fh.diff_stats(cp)
+
+    # 确认信息作为第二级菜单的 header 由 picker 一起渲染
+    header = [
+        ("", "\n"),
+        ("class:desc", f"  │ {_one_line(cp.prompt, 100)}\n"),
+        ("class:desc", f"  │ （{_age_text(cp.timestamp)}）\n"),
+        ("", "\n"),
+    ]
+    if plan:
+        name, plus, minus = _changes_headline(plan)
+        header += [
+            ("", "代码将恢复 "),
+            ("class:plus", f"+{plus}"),
+            ("class:minus", f" -{minus}"),
+            ("", f"（{name}）\n"),
+        ]
+    else:
+        header.append(("class:desc", "代码没有改动\n"))
+    header.append(("class:desc", "⚠ 手动或经 run_command 改动的文件不受回退影响\n\n"))
+
+    channel_options = [
+        ("both", "对话和代码都回退", None),
+        ("conversation", "只回退对话", None),
+        ("code", "只回退代码", None),
+        (None, "取消", None),
+    ]
+    async with in_terminal():
+        channel = await _ListPicker("将回退到你发出这条消息之前：", channel_options, header=header).run()
+    if channel is None:
+        return True
+
+    # 先回退文件再回退对话，顺序不能反：回退对话会把这个检查点连同它之后的一起丢掉
+    if channel in ("both", "code"):
+        fh.rewind_files(cp)
+    if channel in ("both", "conversation"):
+        # 截断内存里的历史，并整体重写会话文件
+        state.history = state.history[: cp.history_index]
+        session.rewrite_messages(state.session_id, state.history)
+        # 被截掉的对话对应的检查点不再有意义，丢弃
+        fh.drop_from(cp)
+        # 把被回退的那条输入回填到输入框，用户改一改就能重发
+        state.pending_input = cp.prompt
+        # token 计数按剩下的历史重算，进程内的 API 调用记录清空，记忆允许再召回
+        _recount_tokens(state)
+        state.last_api_calls.clear()
+        state.surfaced_memories = set()
+        state.compact_failures = 0
+    # 无论回退哪个通道，readFileState 登记的内容和 mtime 都已过期，必须清空，否则先读后写闸门会放行基于旧内容的编辑
+    state.read_file_state = ReadFileState()
+
+    console.print(f"已回退到 {datetime.fromtimestamp(cp.timestamp):%H:%M} 的检查点\n")
+    return True
+
+
+async def cmd_compact(state: SessionState, args: str = "") -> bool:
+    """
+    手动压缩上下文，可以带补充指令，如 /compact 重点保留文件改动。
+    """
+    try:
+        await compact.run_compact(state, custom_instructions=args)
+    except Exception as e:
+        console.print(f"[red]压缩失败：{type(e).__name__}: {e}[/]\n")
+    return True
+
+
 def cmd_status(state: SessionState) -> bool:
-    """展示当前会话的本地统计，读取这些数据不需要调用模型接口。"""
-    # 历史条数不是用户提问次数，一轮需求可能产生多条模型和工具消息。
-    console.print(f"会话编号：       {state.session_id}")
     console.print(f"模型：           {state.model_name}")
-    console.print(f"权限模式：       {state.permissions.mode}")
+    console.print(f"权限模式：       {permissions.state.mode}")
     console.print(f"历史消息条数：    {len(state.history)}")
-    from compact import context_tokens, compact_threshold
-    used, threshold = context_tokens(state.history), compact_threshold()
-    console.print(f"当前上下文估算：  {used:,} / {threshold:,} tokens（自动压缩水位）")
+    used = compact.context_tokens(state.history)
+    threshold = compact.compact_threshold()
+    if used:
+        console.print(f"当前上下文占用（估算）：{used:,} / {threshold:,} tokens（{used * 100 // threshold}%）")
+    else:
+        console.print(f"当前上下文占用（估算）：暂无数据（自动压缩阈值 {threshold:,} tokens）")
     console.print(f"累计输入 tokens：{state.input_tokens}")
     console.print(f"累计输出 tokens：{state.output_tokens}\n")
     return True
 
 
-async def cmd_resume(state: SessionState) -> bool:
-    """按编号选择项目中的历史会话，校验完成后一次性替换当前内存状态。"""
-    sessions, unreadable = list_sessions()
-    for name in unreadable:
-        console.print(f"跳过无法读取的会话：{name}", style="yellow", markup=False)
-    if not sessions:
-        console.print("当前项目还没有已保存的会话。\n")
+def cmd_mcp(state: SessionState) -> bool:
+    """
+    显示所有已配置 MCP server 的连接状态和工具清单。
+    """
+    if not mcp_servers.RECORDS:
+        console.print(f"未配置任何 MCP server。可在项目根目录的 .mcp.json 或 {mcp_servers.USER_CONFIG} 中添加。\n")
         return True
-    console.print("历史会话（最近更新的在前）：")
-    for index, session in enumerate(sessions, 1):
-        updated = session.updated_at.astimezone().strftime("%Y-%m-%d %H:%M")
-        console.print(f"  {index}. {updated}  {session.title}  [{session.session_id[:8]}]", markup=False)
-    try:
-        # 复用现有输入依赖，不引入新的选择菜单库；空输入或 q 表示取消。
-        choice = (await PromptSession().prompt_async("选择会话编号（回车或 q 取消）：")).strip()
-    except (EOFError, KeyboardInterrupt):
-        console.print("已取消恢复。\n")
-        return True
-    if not choice or choice.lower() == "q":
-        return True
-    if not choice.isdecimal() or not 1 <= int(choice) <= len(sessions):
-        console.print("编号无效，当前会话未改变。\n")
-        return True
-    selected = sessions[int(choice) - 1]
-    # 恢复前先补存当前会话；保存失败时仍保留当前状态，不贸然切换。
-    save_session(state)
-    # 列表展示之后当前会话可能刚补存过，重新加载才能拿到最新完整历史。
-    selected = load_session(selected.session_id)
-    from rewind_store import RewindStore
-    new_rewind = RewindStore(state.permissions.rewind.root)
-    new_rewind.bind(selected.session_id)
-    # 先校验并加载任务，再修改会话字段；坏任务文件不能导致半次切换。
-    state.permissions.tasks.bind(selected.session_id)
-    state.permissions.rewind = new_rewind
-    state.history = selected.history
-    state.session_id = selected.session_id
-    state.saved_messages = len(selected.history)
-    state.input_tokens = selected.input_tokens
-    state.output_tokens = selected.output_tokens
-    state.last_api_calls.clear()
-    state.next_prompt = ""
-    state.compact_failures = 0
-    # 模型继续使用当前 core.py 配置；不因历史文件而偷偷切换模型。
-    state.permissions.files.clear()
-    console.print(f"已恢复会话 {selected.session_id}，共 {len(selected.history)} 条消息。\n")
-    print_tasks(state)
-    return True
-
-
-def print_tasks(state: SessionState) -> None:
-    """完整显示当前任务进度；使用 Text，模型生成的标题不解释成 Rich 标签。"""
-    from rich.table import Table
-    from rich.text import Text
-
-    tasks = state.permissions.tasks.list()
-    if not tasks:
-        return
-    names = {"pending": "待办", "in_progress": "进行中", "completed": "已完成"}
-    table = Table(title="当前会话任务", expand=True)
-    for heading in ("编号", "状态", "任务"):
-        table.add_column(heading)
-    for task in tasks:
-        table.add_row(str(task["id"]), names[task["status"]], Text(task["subject"]))
-    console.print(table)
-
-
-def cmd_tasks(state: SessionState) -> bool:
-    """本地查看清单，不发起模型请求、不重新执行任务。"""
-    if state.permissions.tasks.list():
-        print_tasks(state)
-    else:
-        console.print("当前会话没有任务。\n")
-    return True
-
-
-async def cmd_compact(state: SessionState, args: str = "") -> bool:
-    """手动压缩，可附重点；失败保留当前历史和文件登记，不阻止继续输入。"""
-    from compact import run_compact, print_compact_result
-    if not state.history:
-        console.print("当前没有可压缩的对话。\n")
-        return True
-    console.print("正在压缩上下文…")
-    try:
-        result = await run_compact(state, args)
-    except Exception as error:
-        message = str(error) if isinstance(error, ValueError) else type(error).__name__
-        console.print(f"压缩未完成：{message}。当前历史保留。", style="yellow", markup=False)
-        return True
-    print_compact_result(result)
-    return True
-
-
-async def cmd_rewind(state: SessionState) -> bool:
-    """选一轮的开始位置，再选择回退对话/代码/两者；空输入和中断不操作。"""
-    from rewind import apply_rewind
-    from prompt_toolkit.key_binding import KeyBindings
-
-    points = state.permissions.rewind.choices(len(state.history))
-    if not points:
-        console.print("当前会话没有检查点；旧会话在功能启用前的改动无法回退。\n")
-        return True
-    console.print("回退到以下用户需求开始之前（会撤销所选轮次及后续轮次）：")
-    for index, point in enumerate(points, 1):
-        names = {edit.path for edit in point.edits}
-        console.print(f"  {index}. {point.prompt[:160]}  [本轮登记 {len(names)} 个文件]", markup=False)
-    bindings = KeyBindings()
-
-    @bindings.add("escape")
-    def cancel(event):
-        event.app.exit(result="q")
-
-    session = PromptSession(key_bindings=bindings)
-    try:
-        choice = (await session.prompt_async("选择编号（回车或 q 取消）：")).strip()
-        if not choice or choice.lower() == "q":
-            return True
-        if not choice.isdecimal() or not 1 <= int(choice) <= len(points):
-            console.print("编号无效，未回退。\n")
-            return True
-        selected = points[int(choice) - 1]
-        checkpoints = state.permissions.rewind.document.checkpoints
-        start = next(i for i, point in enumerate(checkpoints) if point.id == selected.id)
-        paths = sorted({edit.path for point in checkpoints[start:] for edit in point.edits})
-        console.print("代码模式将检查并恢复以下文件：", markup=False)
-        for path in paths:
-            console.print(f"  {path}", markup=False)
-        console.print("1：仅对话（保留代码）；2：仅代码（保留对话）；3：对话和代码。")
-        mode = (await session.prompt_async("选择模式并执行（回车或 q 取消）：")).strip()
-    except (EOFError, KeyboardInterrupt):
-        console.print("已取消回退。\n")
-        return True
-    modes = {"1": "conversation", "2": "files", "3": "both"}
-    if mode not in modes:
-        console.print("已取消回退。\n")
-        return True
-    try:
-        count = apply_rewind(state, selected.id, modes[mode])
-    except (OSError, ValueError) as error:
-        console.print(f"回退未完成：{error}", style="yellow", markup=False)
-        return True
-    console.print(f"回退完成，模式：{modes[mode]}；检查并恢复 {count} 个文件。", markup=False)
-    if mode != "2":
-        console.print("原会话保留，新分支继续；选中的用户输入已放回输入区，可编辑后提交。")
+    for record in mcp_servers.RECORDS:
+        console.print(f"[bold]{record.server.id}[/]  [dim]{escape(record.transport)}[/]")
+        if record.status == "connected":
+            console.print(f"  [green]已连接[/]，{len(record.tool_names)} 个工具")
+            for name in record.tool_names:
+                console.print(f"    - {name}")
+        else:
+            console.print(f"  [red]连接失败[/]：{escape(record.error)}")
+        console.print()
     return True
 
 
 def cmd_memory(state: SessionState) -> bool:
-    """只读本地记忆索引，不发起模型请求；正文可在 Markdown 文件中人工检查和编辑。"""
-    console.print(f"长期记忆目录：{state.permissions.memory.directory}", markup=False)
-    console.print(state.permissions.memory.index(), markup=False)
+    """
+    显示记忆目录、所有记忆文件和 MEMORY.md 索引。
+    """
+    console.print(f"记忆目录：{store.memory_dir()}\n")
+    headers = store.scan_memory_files()
+    if not headers:
+        console.print("(还没有任何记忆，记忆会随对话逐渐积累)\n")
+        return True
+    for h in headers:
+        age = store.age_text(store.age_days(h.mtime))
+        console.print(escape(f"  [{h.type or '?'}] {h.filename}（{age}）"))
+        console.print(f"      [dim]{escape(h.description)}[/]")
+    console.print()
+    index = store.read_index()
+    if index:
+        console.print("MEMORY.md 索引：")
+        console.print(Padding(Markdown(index), (0, 0, 0, 2)))
+        console.print()
+    return True
+
+
+async def cmd_dream(state: SessionState) -> bool:
+    """
+    手动触发记忆合并整理，跳过自动闸门，方便立刻看到效果。
+    """
+    console.print("开始整理记忆，可能需要一会儿...\n")
+    try:
+        await background.dream(list(state.history), force=True, session_id=state.session_id)
+    except Exception as e:
+        console.print(f"[red]整理失败：{type(e).__name__}: {e}[/]\n")
+    console.print()
     return True
 
 
@@ -401,22 +657,18 @@ def cmd_api_detail(state: SessionState) -> bool:
     """
     显示最近一轮 user input 触发的所有 model API 调用元数据。
     """
-    # 读取上轮的日志快照；当前命令不会自己再发起一次模型请求。
     if not state.last_api_calls:
         console.print("(还没有任何模型调用记录，先发一条消息再来看)\n")
         return True
 
     console.print(f"最近一轮共发起 {len(state.last_api_calls)} 次 model API 调用\n")
 
-    # enumerate(..., 1) 为每次模型调用生成从 1 开始的展示编号。
-    # 一个用户需求可以对应多个 Call，常见原因是工具结果需要交回模型继续判断。
     for i, call in enumerate(state.last_api_calls, 1):
         console.print(f"[bold]Call #{i}[/]")
         console.print(f"  Request:")
         console.print(f"    model:        {call.model}")
         console.print(f"    messages:     {call.messages_count} 条")
         if call.last_part is not None:
-            # 复用片段格式化函数展示请求尾部内容，而不是输出全部历史。
             preview = _format_part_line(call.last_part)
             if preview:
                 console.print(f"    last_message: {preview}")
@@ -429,16 +681,15 @@ def cmd_api_detail(state: SessionState) -> bool:
     return True
 
 
-# 命令名 -> Command 对象；handler 只接收共享 state，统一用 bool 控制是否继续。
-# 添加命令时定义 cmd_* 函数并在此注册，main.py 的分发逻辑通常无需修改。
 COMMANDS = {
-    "compact": Command("compact", "压缩上下文，可附重点，例如 /compact 保留错误原文", cmd_compact, takes_args=True),
-    "rewind": Command("rewind", "回退到某轮需求之前：对话、代码或两者", cmd_rewind),
-    "memory": Command("memory", "查看项目长期记忆索引及存储目录", cmd_memory),
-    "tasks": Command("tasks", "查看当前会话的任务清单", cmd_tasks),
     "new": Command("new", "开启新会话", cmd_new),
-    "resume": Command("resume", "选择并恢复当前项目的历史会话", cmd_resume),
+    "resume": Command("resume", "恢复历史会话", cmd_resume),
+    "rewind": Command("rewind", "回退到之前的检查点", cmd_rewind),
+    "compact": Command("compact", "压缩上下文（可带补充指令）", cmd_compact, takes_args=True),
     "status": Command("status", "显示当前会话状态", cmd_status),
+    "mcp": Command("mcp", "查看 MCP server 状态和工具", cmd_mcp),
+    "memory": Command("memory", "查看长期记忆", cmd_memory),
+    "dream": Command("dream", "立即整理合并长期记忆", cmd_dream),
     "api-detail": Command("api-detail", "显示最近一轮 model API 调用详情", cmd_api_detail),
     "help": Command("help", "显示可用命令", cmd_help),
     "exit": Command("exit", "退出程序", cmd_exit),

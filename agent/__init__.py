@@ -8,11 +8,14 @@
 
 子模块（tools / hooks / core）是实现细节，不需要直接 import。
 """
-# __init__.py 定义包对外提供哪些对象；主程序不必了解子模块的组装细节。
-# 注意这个导入会执行 core.py 的顶层代码，包括 .env 加载和 API_KEY 校验。
+from dotenv import load_dotenv
+from pathlib import Path
+
+# 先加载现有 .env，再导入会创建模型客户端的 core/hooks/classifier。
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 from .core import agent, MODEL_NAME
+from .file_state import ReadFileState
 from .hooks import api_call_log, ApiCall
 
-# __all__ 约定公开接口，并控制 from agent import * 的导入范围。
-# 它不是访问权限控制，调用方仍可以显式导入 agent.tools 等子模块。
-__all__ = ["agent", "MODEL_NAME", "api_call_log", "ApiCall"]
+__all__ = ["agent", "MODEL_NAME", "api_call_log", "ApiCall", "ReadFileState"]

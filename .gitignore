@@ -12,3 +12,5 @@ venv/
 .venv
 .sessions/
 .memory/
+.mcp.json
+.reference-migration-backup/

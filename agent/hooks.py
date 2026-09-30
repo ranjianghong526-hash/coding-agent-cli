@@ -1,153 +1,265 @@
 """
-挂在 Agent 上的 hooks，用来抓每次 model API 调用的元数据。
-
-主循环在每轮 run_agent 之前清空 api_call_log，跑完后快照到 SessionState 里，
-/api-detail 命令再把这一轮的所有调用展示给用户。
-
-hook（钩子）是框架在指定时机自动调用的函数：请求前检查文件变化并记录日志，请求失败时补日志，
-工具执行前审批，工具未知异常时转换为 ModelRetry，让模型有机会修正操作。
-日志只记录模型调用的摘要，没有保存完整的 HTTP 请求体和响应体。
+挂在 Agent 上的 hooks：
+1. API 调用元数据记录（/api-detail 命令用）
+2. system-reminder 注入（每次 model 请求前，把过期文件提醒和 task 提醒追加进 messages）
+3. API 请求失败时的自动重试（wrap_model_request）
+4. 工具执行异常的兜底处理（on_tool_execute_error）
 """
 import asyncio
-from dataclasses import dataclass, field, replace
+import dataclasses
+from dataclasses import dataclass, field
 from typing import Any
-from pydantic_core import to_jsonable_python
 
 from pydantic_ai.capabilities import Hooks
-from pydantic_ai import ModelRetry
-from pydantic_ai.exceptions import SkipToolExecution
+from pydantic_ai.exceptions import ModelHTTPError, ModelAPIError
+from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, UserPromptPart
 
-from permissions import PermissionState, check_permission
-from context_injection import collect_external_changes, make_system_reminder
+import classifier
+import permissions
+from ui.render import console, print_step
+
+from .deps import AgentDeps
+from .reminders import build_reminder_text, build_task_reminder_text
 
 
-# dataclass 根据字段自动生成初始化方法等，适合保存结构明确的一条调用记录。
+MAX_RETRIES = 3
+
+# task_reminder 触发阈值
+# 距上次 task_create / task_update 调用 >= 这么多轮才考虑提醒
+TASK_REMINDER_TURNS_SINCE_WRITE = 6
+# 距上次 task_reminder 注入 >= 这么多轮，避免连续刷屏
+TASK_REMINDER_TURNS_BETWEEN = 4
+
+# 哪些工具算"task 管理动作"——调过它们就重置 since_write 计数
+_TASK_MANAGEMENT_TOOLS = {"task_create", "task_update"}
+
+
 @dataclass
 class ApiCall:
     """
     一次 model API 调用的元数据。before_model_request 创建并填充上半部分，
     after_model_request 填充下半部分。
     """
-    # 请求侧：发给哪个模型、带了多少条历史消息、提供了哪些工具。
+    # request 侧
     model: str
     messages_count: int
     # 这次发送给模型的 messages 中最后一条消息的最后一个 part
     last_part: Any
-    # 这里保存可用工具的名称，不表示这些工具在本次请求中都被调用了。
     tools: list
-    # 响应侧默认为空，在 after hook 收到模型返回后再补充。
+    # response 侧（after hook 填充）
     finish_reason: str = ""
-    # default_factory 每次创建独立列表，避免不同 ApiCall 共享可变数据。
     parts_kinds: list = field(default_factory=list)
-    # tokens 是模型处理文本的计量单位，这里分别记录输入和生成输出的用量。
     input_tokens: int = 0
     output_tokens: int = 0
 
 
-# 主循环在每轮 run_agent 之前清空它
-# 全局列表用于当前串行 CLI；若改成同时执行多个任务，需要按任务隔离记录。
+# 主循环在每轮 agent.iter() 之前清空它
 api_call_log: list[ApiCall] = []
 
-# 这个对象通过 core.py 的 capabilities=[hooks] 挂到 Agent 上。
 hooks = Hooks()
 
 
-@hooks.on.before_tool_execute
-async def _approve_tool(ctx, *, call, tool_def, args):
-    """参数校验完成、工具尚未执行时审批，拒绝后不会发生文件或命令副作用。"""
-    if not isinstance(ctx.deps, PermissionState):
-        # 调用方必须明确传入权限状态；漏传时不能绕过审批直接执行工具。
-        raise SkipToolExecution("[权限拒绝] 缺少权限上下文，工具未执行。")
-    # ctx.messages 包括本轮真实用户输入和模型刚提出的工具调用，不能只传上轮历史。
-    # SDK 校验后，嵌套参数可能已变成 Pydantic 对象；审批/分类器需要 JSON 数据。
-    # 只转换审批副本，return args 仍把原来的校验对象交给真正工具。
-    try:
-        await check_permission(ctx.deps, call.tool_name, to_jsonable_python(args), ctx.messages)
-    except SkipToolExecution:
-        if call.tool_name in ("memory_write", "memory_delete"):
-            # 拒绝也使尚未落盘的旧后台任务失效，不能在提示拒绝后悄悄写回。
-            with ctx.deps.memory.lock:
-                ctx.deps.memory.manual_epoch += 1
-        raise
-    return args
-
+# ---------- API 调用记录 ----------
 
 @hooks.on.before_model_request
 async def _record_request(ctx, request_context):
     """
     每次发起 model 调用之前，创建一条 ApiCall 记录。
     """
-    # SDK 在每次模型请求前调用，包括同一轮工具完成后的再次请求。
-    if isinstance(ctx.deps, PermissionState):
-        reminder = await asyncio.to_thread(collect_external_changes, ctx.deps.files)
-        # 聊天历史可能很长；每次请求都从独立状态生成最新任务清单。
-        task_reminder = ctx.deps.tasks.reminder()
-        reminder = "\n\n".join(text for text in (reminder, task_reminder) if text)
-        if reminder:
-            # 创建新列表；SDK 会将处理后的消息保存为本轮真实历史。
-            request_context = replace(
-                request_context,
-                messages=request_context.messages + [make_system_reminder(reminder)],
-            )
     msgs = list(request_context.messages)
-    # 一条消息可以含多个 part（内容片段），如文本、工具调用或工具结果。
-    # 先判断列表是否为空，避免用 [-1] 访问不存在的最后一项。
     last_part = msgs[-1].parts[-1] if msgs and msgs[-1].parts else None
     try:
-        # 本次请求传给模型的工具定义，提取名称作为便于阅读的摘要。
         tool_names = [t.name for t in request_context.model_request_parameters.function_tools]
     except AttributeError:
-        # 若当前请求没有预期的工具属性，日志按空工具列表记录。
         tool_names = []
-    # 先创建只有请求侧数据的记录，响应钩子会补齐同一个对象。
     api_call_log.append(ApiCall(
         model=request_context.model.model_name,
         messages_count=len(msgs),
         last_part=last_part,
         tools=tool_names,
     ))
-    # 日志在注入之后记录；SDK 随后还会合并相邻请求并转换为提供方格式。
     return request_context
 
 
 @hooks.on.after_model_request
-async def _record_response(ctx, request_context, response):
+async def _record_response(ctx, *, request_context, response):
     """
     每次 model 调用返回后，填充上面这条 ApiCall 的 response 字段。
     """
     if api_call_log:
-        # 当前串行流程下，最后一条记录对应刚返回的模型请求。
-        # 这不是通过请求 ID 匹配，因此不能直接用于并发任务的日志关联。
         call = api_call_log[-1]
-        # finish_reason 描述模型为何结束；缺失时使用明确的 unknown 占位。
         call.finish_reason = str(response.finish_reason) if response.finish_reason else "unknown"
-        # 只保存片段类型，例如 text / tool-call，不在这里渲染具体内容。
         call.parts_kinds = [p.part_kind for p in response.parts]
         call.input_tokens = response.usage.input_tokens
         call.output_tokens = response.usage.output_tokens
-    # 原样返回响应，日志收集不改变后续的工具调度和结果处理。
     return response
 
 
-@hooks.on.model_request_error
-async def _record_request_error(ctx, request_context, error):
-    """请求最终失败时补全日志，再原样抛出，交给 CLI 安全网处理。"""
-    if api_call_log:
-        # 不记录原始响应体，避免把接口错误中的敏感信息展示到 /api-detail。
-        status = getattr(error, "status_code", None)
-        api_call_log[-1].finish_reason = f"error: {status or type(error).__name__}"
-    raise error
+# ---------- system-reminder 注入 ----------
 
+def _scan_task_turn_counters(messages) -> tuple[int, int]:
+    """
+    一次反向扫描历史，同时算出 (距上次 task 管理工具多少轮, 距上次 task_reminder 多少轮)。两个结果都拿到就早退，避免长 history 下扫两遍。
+    """
+    since_mgmt = 0
+    since_reminder = 0
+    found_mgmt = False
+    found_reminder = False
+    for msg in reversed(messages):
+        if isinstance(msg, ModelResponse):
+            if not found_mgmt:
+                for part in msg.parts:
+                    if isinstance(part, ToolCallPart) and part.tool_name in _TASK_MANAGEMENT_TOOLS:
+                        found_mgmt = True
+                        break
+                if not found_mgmt:
+                    since_mgmt += 1
+            if not found_reminder:
+                since_reminder += 1
+        elif isinstance(msg, ModelRequest) and not found_reminder:
+            for part in msg.parts:
+                if isinstance(part, UserPromptPart) and isinstance(part.content, str) and _REMINDER_SENTINELS["task"] in part.content:
+                    found_reminder = True
+                    break
+        if found_mgmt and found_reminder:
+            break
+    return since_mgmt, since_reminder
+
+
+def _build_file_reminder(ctx, messages) -> str | None:
+    # 单次扫描的 readFileState 变更检测；只看 state，不看 messages
+    return build_reminder_text(ctx.deps.read_file_state)
+
+
+def _build_task_reminder(ctx, messages) -> str | None:
+    # task reminder 的两道阈值都过了才发：沉默够久 + 上次提醒也够久了
+    since_mgmt, since_reminder = _scan_task_turn_counters(messages)
+    if since_mgmt < TASK_REMINDER_TURNS_SINCE_WRITE:
+        return None
+    if since_reminder < TASK_REMINDER_TURNS_BETWEEN:
+        return None
+    return build_task_reminder_text(ctx.deps.tasks_store)
+
+
+# 注册要在 before_model_request 触发的 reminder builder：每条 (sentinel, builder)，sentinel 仅用于回扫识别（task reminder 复用）
+_REMINDER_SENTINELS = {
+    # task reminder 的识别串就是它正文里 builder 必定带的那句话，不再单独嵌一个 marker
+    "task": "task 工具最近没有被使用",
+}
+_REMINDER_BUILDERS = (_build_file_reminder, _build_task_reminder)
+
+
+@hooks.on.before_model_request
+async def _inject_reminders(ctx, request_context):
+    """
+    依次跑每个注册过的 reminder builder：返回非 None 的就拼到 request_context.messages 末尾。当前两条：过期文件提醒（看 readFileState）+ task 提醒（看 turn 计数 + tasks_store）。要加第 3 种 reminder 时只需多写一个 builder，不必再复制一次 hook 框架。
+    """
+    messages = list(request_context.messages)
+    appended = []
+    for builder in _REMINDER_BUILDERS:
+        text = builder(ctx, messages + appended)
+        if text is None:
+            continue
+        appended.append(ModelRequest(parts=[UserPromptPart(content=text)]))
+        print_step("[dim]◇ system[/]", f"[dim]{text[:200]}[/]")
+    if not appended:
+        return request_context
+    return dataclasses.replace(request_context, messages=messages + appended)
+
+
+# ---------- API 请求重试 ----------
+
+@hooks.on.model_request
+async def _retry_on_error(ctx, *, request_context, handler):
+    """
+    包裹 model 请求，遇到可重试错误时自动指数退避重试。
+
+    重试在 wrap 内部完成，对话历史和 before/after hooks 不受影响。
+    """
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return await handler(request_context)
+        except ModelHTTPError as e:
+            if e.status_code < 500:
+                raise
+            if attempt >= MAX_RETRIES:
+                console.print(f"[bold red]✗ HTTP {e.status_code}，重试 {MAX_RETRIES} 次后仍失败[/]")
+                raise
+            wait = 2 ** attempt
+            console.print(
+                f"[bold yellow]⟳ HTTP {e.status_code}，{wait}s 后重试 "
+                f"({attempt + 1}/{MAX_RETRIES})...[/]"
+            )
+            await asyncio.sleep(wait)
+        except ModelAPIError as e:
+            if attempt >= MAX_RETRIES:
+                console.print(
+                    f"[bold red]✗ 网络连接失败，重试 {MAX_RETRIES} 次后仍无法连接[/]"
+                )
+                raise
+            wait = 2 ** attempt
+            console.print(
+                f"[bold yellow]⟳ 网络连接失败，{wait}s 后重试 "
+                f"({attempt + 1}/{MAX_RETRIES})...[/]"
+            )
+            await asyncio.sleep(wait)
+
+
+# ---------- 工具调用权限检查 ----------
+
+@hooks.on.tool_execute
+async def _check_permission(ctx, *, call, tool_def, args, handler):
+    """
+    工具执行前的权限关卡。allow 就调用 handler 真正执行；
+    ask 就弹审批列表；deny 则把拒绝原因当作工具结果回填，让模型自行纠正。
+    auto 模式下，ask 不直接弹窗，先交给 LLM classifier 判定。
+    """
+    decision = permissions.compute_decision(call.tool_name, args)
+    if decision == "allow":
+        # 放行，handler(args) 才是真正执行工具的那一步
+        return await handler(args)
+
+    # decision == "ask" 且当前是 auto 模式：让 classifier 替用户做决定
+    if permissions.state.mode == permissions.AUTO:
+        # 审查过程对齐成和 thinking、tool_call 一样的「图标 + 标签独占一行、内容换行」格式，用蓝色让用户一眼看到 classifier 在工作
+        print_step("[blue]◆ auto_check[/]", f"[blue dim]正在请 LLM 审查 {call.tool_name}...[/]")
+        verdict = await classifier.classify(ctx.messages, call.tool_name, args)
+
+        if verdict.get("error"):
+            # classifier 自己出错，回退到下面的人工审批弹窗，不能因为审查失败就放行
+            print_step("[yellow]⚠ auto_check[/]", f"[yellow]{verdict['reason']}[/]")
+        elif not verdict["should_block"]:
+            # classifier 判定安全，放行执行，并把理由打出来让用户随时能审计；标签用 ✔ 表示放行
+            print_step("[blue]✔ auto_check[/]", f"[blue dim]放行：{verdict['reason']}[/]")
+            return await handler(args)
+        else:
+            # classifier 判定危险：和人工拒绝一样回填给模型，多带上一句拦截理由；标签用 ✘ 表示拦截
+            print_step("[red]✘ auto_check[/]", f"[red]拦截：{verdict['reason']}[/]")
+            return (
+                f"安全检查拦截了这次 {call.tool_name} 调用，没有执行。拦截理由：{verdict['reason']}。"
+                "不要尝试绕过拦截，请停下来向用户说明情况，由用户决定接下来怎么做。"
+            )
+
+    # default / acceptEdits 模式的 ask，或 auto 模式下 classifier 出错的回退：弹审批让用户决定
+    choice = await permissions.prompt_approval(call.tool_name, args)
+    if choice == "once":
+        return await handler(args)
+    if choice == "always":
+        # 记进会话白名单，本会话内这个工具不再询问
+        permissions.state.session_allowed.add(call.tool_name)
+        return await handler(args)
+
+    # 拒绝：不执行工具，把拒绝原因回填给模型，让它停下来等用户发话，而不是自作主张绕过去
+    return f"用户拒绝了对 {call.tool_name} 的调用，这次调用没有执行。请停下手上的事，等用户告诉你接下来该怎么做。"
+
+
+# ---------- 工具执行异常兜底 ----------
 
 @hooks.on.tool_execute_error
-async def _recover_tool_error(ctx, *, call, tool_def, args, error):
-    """第二道工具防线：把未预料到的异常变成有次数限制的模型修正提示。"""
-    if isinstance(error, ModelRetry):
-        # 工具自己提供的修正信息保持不变，不覆盖成通用提示。
-        raise error
-    # 此处是框架明确提供的异常边界；不吞异常、不返回成功，也不输出原始异常内容。
-    # ModelRetry 会生成 retry-prompt 交给模型，由模型选择改参数、换工具或解释失败。
-    raise ModelRetry(
-        f"工具 {call.tool_name} 执行失败（{type(error).__name__}）。"
-        "请检查参数和调用方式，修正后再尝试；无法修复时向用户说明失败。"
-    ) from error
+async def _handle_tool_error(ctx, *, call, tool_def, args, error):
+    """
+    工具函数抛出未捕获异常时，不让进程崩溃，
+    而是把错误信息作为 tool result 返回给模型，让它自行纠正。
+    """
+    console.print(f"[bold red]✗ 工具 {call.tool_name} 出错：{error}[/]")
+    return f"工具执行出错：{type(error).__name__}: {error}"

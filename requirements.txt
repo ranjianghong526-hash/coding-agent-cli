@@ -1,5 +1,7 @@
-pydantic-ai
+pydantic-ai-slim[openai,mcp]==2.51.0
+mcp>=2.2,<3
 prompt-toolkit
+questionary==2.1.1
 rich
 python-dotenv
 openai

@@ -1,264 +1,189 @@
-"""命令行入口：把终端输入、Agent 执行和结果展示串成完整的一轮交互。
-
-推荐先读 main() 建立全貌，再沿着它调用的三个函数往下看。
-这里的 while 循环负责多轮对话；通过 agent.iter() 在节点之间展示模型和工具结果。
-"""
-
 import asyncio
-from inspect import isawaitable
 
-from session_store import save_session
-from memory_worker import MemoryWorker
-from compact import auto_compact_if_needed
+from pydantic_ai import Agent
+from pydantic_graph import End
 
-from pydantic_ai import Agent, FunctionToolResultEvent
-from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
-
-# prompt_toolkit 负责输入体验，模型判断与工具执行不由它处理。
-from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import ThreadedCompleter
-from prompt_toolkit.key_binding import KeyBindings
-from file_mentions import FileMentionCompleter, prepare_file_messages
-
-# 导入 agent 包时会执行 agent/__init__.py，并进一步执行 core.py 的模型配置。
-# 因此 API_KEY 校验发生在进入 main() 之前。
+import compact
+import mcp_servers
+from legacy_migration import migrate_legacy_data
+import session
 from agent import agent, MODEL_NAME, api_call_log
-# UI 模块提供命令注册表、会话数据结构和展示函数，入口只负责调度它们。
+from agent.deps import AgentDeps
+from file_history import FileHistory
+from memory import background, recall, store
+from tasks_store import TasksStore
 from ui.commands import (
     COMMANDS,
     SessionState,
     console,
     print_part,
-    print_tasks,
-    print_divider,
     print_welcome_banner,
 )
-
-# PromptSession 比内置 input() 好用：支持左右移动光标编辑，还会记住本次运行的输入历史，上下方向键可以翻
-prompt_session = PromptSession()
-# 文件扫描放到后台线程，输入中文和切换权限模式时不等待目录遍历。
-file_completer = ThreadedCompleter(FileMentionCompleter())
-
-
-def permission_key_bindings(state: SessionState) -> KeyBindings:
-    """仅在主输入区绑定快捷键，审批输入不会意外切换权限模式。"""
-    bindings = KeyBindings()
-
-    @bindings.add("s-tab")
-    def switch_mode(event):
-        state.permissions.cycle_mode()
-        event.app.invalidate()
-
-    return bindings
-
-
-async def read_user_input(state: SessionState | None = None):
-    """
-    打印上横线并读一行用户输入；回车后再补一条下横线，让输入在滚动历史里保持上下边界。返回 None 表示用户希望退出（Ctrl-C / Ctrl-D）。
-    """
-    print_divider()
-    if state is not None:
-        print_tasks(state)
-    try:
-        # 去掉首尾空白；空输入会由 main() 跳过，不会发送给模型。
-        # main() 已运行在事件循环中，使用异步输入，避免同步 prompt() 嵌套事件循环。
-        options = {} if state is None else {
-            "key_bindings": permission_key_bindings(state),
-            "bottom_toolbar": lambda: f"权限：{state.permissions.mode}  |  Shift+Tab 切换模式",
-        }
-        options.update(completer=file_completer, complete_while_typing=True)
-        if state is not None and state.next_prompt:
-            options["default"] = state.next_prompt
-        user_input = (await prompt_session.prompt_async("❯ ", **options)).strip()
-        if state is not None:
-            state.next_prompt = ""
-    except (EOFError, KeyboardInterrupt):
-        # 将 Ctrl-D / Ctrl-C 统一转换成 None，主循环据此退出。
-        print()
-        return None
-    print_divider()
-    return user_input
+from ui.input_ui import Repl
+from mentions import build_mention_messages, extract_at_mentions
 
 
 async def handle_command(user_input, state):
     """
     处理以 / 开头的命令。
-    返回 'pass'：不是命令，主循环继续往下走交给 Agent；
-    返回 'continue'：命令已处理，主循环跳到下一轮；
-    返回 'break'：命令要求退出主循环。
+    返回 'pass'：不是命令，交给 Agent；
+    返回 'continue'：命令已处理，进入下一轮；
+    返回 'break'：命令要求退出程序。
     """
     if not user_input.startswith("/"):
-        # 普通自然语言需求继续走 Agent 分支。
         return "pass"
-    # 只拆命令名和剩余整段文本，/compact 的补充要求不会被拆成多个词。
-    words = user_input[1:].split(maxsplit=1)
-    if not words:
-        console.print("请输入命令名，例如 /help\n")
-        return "continue"
-    cmd_name = words[0]
-    # 注册表把名字映射到 Command 对象，避免为每条命令写一个 if 分支。
+    cmd_name, _, args = user_input[1:].partition(" ")
     command = COMMANDS.get(cmd_name)
     if command is None:
         console.print(f"未知命令：/{cmd_name}，输入 /help 查看可用命令\n")
         return "continue"
-    # handler 的 bool 返回值是统一约定：True 继续接收输入，False 退出。
-    result = command.handler(state, words[1].strip() if len(words) > 1 else "") if command.takes_args else command.handler(state)
-    if isawaitable(result):
-        # 只有异步命令需要 await；原有同步命令沿用原来的返回约定。
+    # 声明接收参数的命令（如 /compact），把命令名后面的整段文本传给它
+    if command.takes_args:
+        result = command.handler(state, args.strip())
+    else:
+        result = command.handler(state)
+    # 个别命令（如 /resume）要弹交互式列表，是异步的，需要 await
+    if asyncio.iscoroutine(result):
         result = await result
     return "continue" if result else "break"
 
 
 def apply_result(state, result):
     """
-    跑完一轮 Agent 后保存历史、用量和调用日志；过程已在执行期间显示。
+    跑完一轮 Agent 后，把结果同步到 SessionState。
     """
-    # 完整历史包含之前的对话和本轮新增消息，还包括工具请求与工具返回。
-    # 下一轮传给模型时，它才能理解“继续修改刚才的文件”这类上下文。
     state.history = result.all_messages()
-    # 一轮需求可能触发多次模型请求；这里累计的是整轮的 token 用量。
-    # SDK 旧版本提供 usage()，新版本提供 usage 属性；依赖未锁版本，兼容两种接口。
-    usage = result.usage
-    usage = usage() if callable(usage) else usage
+    usage = result.usage()
     state.input_tokens += usage.input_tokens
     state.output_tokens += usage.output_tokens
-    # 复制列表，避免下一轮 api_call_log.clear() 连带清空上轮保存的列表。
-    # 这是浅复制：ApiCall 对象仍共享，但当前串行流程在本轮结束后不再修改它们。
     state.last_api_calls = list(api_call_log)
-    try:
-        # 每轮成功后持久化新增历史；保存失败不把已完成的模型任务误判为执行失败。
-        save_session(state)
-    except Exception as error:
-        # 存储边界的最后防线：明确提示未落盘，内存历史仍可继续使用或下轮补存。
-        console.print(
-            f"本轮已完成，但会话保存失败（{type(error).__name__}）。"
-            "历史仍在内存中，请检查磁盘权限或空间；下轮会再次尝试保存。",
-            style="yellow", markup=False,
-        )
+    # 把本轮新增的消息追加到会话文件
+    session.append_messages(state.session_id, result.new_messages())
 
 
-async def run_agent(user_input: str, state: SessionState):
-    """逐节点执行一轮任务，模型返回和工具完成时立刻复用现有 UI 展示。
-
-    iter() 返回异步上下文管理器；节点中的模型请求和工具操作仍由框架执行。
-    此处展示完整响应片段，没有消费逐 token 的模型流。
+def inject_at_mentions(user_input, state):
     """
-    completed = False
-    try:
-        # 在创建检查点之前替换历史，新检查点才能记录压缩后的消息下标。
-        await auto_compact_if_needed(state, user_input)
-        state.permissions.tasks.bind(state.session_id)
-        state.permissions.rewind.bind(state.session_id)
-        # 在预读文件及模型/工具执行之前记录本轮起点，失败轮次也可恢复文件。
-        await asyncio.to_thread(state.permissions.rewind.begin, user_input, len(state.history), state.permissions.tasks.document)
-        injected = await asyncio.to_thread(prepare_file_messages, user_input, state.permissions.files)
-        # 新列表不提前改写 state.history：只有整轮成功后 apply_result 才提交历史。
-        history = state.history + injected
-        if injected:
-            for message in injected[1:]:
-                for part in message.parts:
+    解析用户输入里的 @path，把每个被引用的文件伪装成一次 read_file 调用，在 Agent 跑起来之前塞进对话历史。
+    """
+    paths = extract_at_mentions(user_input)
+    if not paths:
+        return
+    mention_messages = build_mention_messages(paths, state.read_file_state)
+    if not mention_messages:
+        return
+    # 塞进历史：模型下一轮就能看到这些「读文件」记录，以为是自己读的
+    state.history += mention_messages
+    # 持久化，/resume 恢复会话时能连同引用进来的文件内容一起还原
+    session.append_messages(state.session_id, mention_messages)
+    # 终端里也回显一下注入了哪些文件，让用户看到 @ 引用确实生效了
+    for msg in mention_messages:
+        for part in msg.parts:
+            print_part(part)
+
+
+async def run_agent_loop(user_input, state):
+    """
+    展开 agent.run_sync()，逐节点驱动 Agent 循环，每步实时打印。
+    """
+    api_call_log.clear()
+
+    # deps 把本会话的 readFileState、tasksStore 和文件检查点一起打包成 AgentDeps 注入工具层，工具内通过 ctx.deps.* 访问
+    deps = AgentDeps(
+        read_file_state=state.read_file_state,
+        tasks_store=state.tasks_store,
+        file_history=state.file_history,
+    )
+    async with agent.iter(
+        user_input, message_history=state.history, deps=deps,
+        toolsets=mcp_servers.active_toolsets(),
+    ) as run:
+        node = run.next_node
+
+        while not isinstance(node, End):
+            node = await run.next(node)
+
+            if Agent.is_call_tools_node(node):
+                for part in node.model_response.parts:
                     print_part(part)
-        # 引用分支已插入原始用户消息，传 None 避免 SDK 再追加一次同样的输入。
-        prompt = None if injected else user_input
-        async with agent.iter(prompt, message_history=history, deps=state.permissions) as agent_run:
-            async for node in agent_run:
-                if Agent.is_model_request_node(node):
-                    # 文件结果已经在 history 中，第一次请求就能看到，不需要模型再决定读取。
-                    console.print("[dim]✻ 正在请求模型…[/]")
-                elif Agent.is_call_tools_node(node):
-                    for part in node.model_response.parts:
+
+            elif Agent.is_model_request_node(node):
+                for part in node.request.parts:
+                    if part.part_kind in ("tool-return", "retry-prompt"):
                         print_part(part)
-                    # 消费工具事件；后续迭代使用已执行结果，不重复跑工具。
-                    async with node.stream(agent_run.ctx) as events:
-                        async for event in events:
-                            if isinstance(event, FunctionToolResultEvent):
-                                print_part(event.part)
-                                if event.part.tool_name in ("task_create", "task_update"):
-                                    print_tasks(state)
-            completed = True
-            return agent_run.result
-    finally:
-        state.permissions.rewind.end()
-        if not completed:
-            # 失败轮次不进入历史，不能保留“模型已看过”的登记；磁盘操作不会撤销。
-            state.permissions.files.clear()
 
-
-def print_run_error(error: Exception) -> None:
-    """把最终失败转换成用户能采取行动的提示，不打印完整响应体或密钥。"""
-    if isinstance(error, ModelHTTPError):
-        hints = {
-            400: "模型请求参数不正确，请检查模型名和接口配置。",
-            401: "API Key 无效，请检查 .env 中的 API_KEY。",
-            402: "账号余额不足，请检查模型服务账号。",
-            403: "接口访问被拒绝，请检查账号权限。",
-            404: "模型或接口不存在，请检查 MODEL_NAME 和服务地址。",
-            429: "请求被限流，自动重试仍失败，请稍后再试。",
-        }
-        message = hints.get(error.status_code, "模型服务请求失败，请稍后再试。")
-        message = f"HTTP {error.status_code}：{message}"
-    elif isinstance(error, UnexpectedModelBehavior):
-        message = "模型响应异常或工具修正次数已耗尽，请调整需求后再试。"
-    else:
-        message = f"本轮执行失败（{type(error).__name__}），请检查网络或运行环境后再试。"
-    console.print(message, style="red", markup=False)
-    console.print("可以继续输入；本轮未保存到对话历史，已保存的任务进度及已执行的文件或命令操作不会自动撤销。\n")
+    apply_result(state, run.result)
+    # 把本轮结果交回给调用方，后台记忆提炼要用本轮新增的消息判断该不该跑
+    return run.result
 
 
 async def main():
-    """维护一份会话状态，持续接收用户输入，直到命令或输入信号要求退出。"""
-    # 默认启动新会话；每轮成功后保存到磁盘，需要旧历史时输入 /resume。
-    state = SessionState(model_name=MODEL_NAME)
-    memory_worker = MemoryWorker(state.permissions.memory)
-    print_welcome_banner("Coding Agent")
+    migrated = migrate_legacy_data()
+    if migrated["sessions"] or migrated["memories"]:
+        console.print(f"已导入旧数据：{migrated['sessions']} 个会话、{migrated['memories']} 条记忆。")
+    for item in migrated["errors"]:
+        console.print(f"旧数据导入失败：{item}，原文件已保留。", markup=False)
+    session_id = session.new_session_id()
+    # 启动时建好记忆目录，system prompt 里承诺过「目录已存在」，模型就不必浪费回合去确认
+    store.ensure_memory_dir()
+    # 本会话的 TasksStore 落盘在 ~/.my-claude-code/tasks/<session_id>/，会话级隔离
+    tasks_store = TasksStore(session_id=session_id)
+    state = SessionState(
+        model_name=MODEL_NAME,
+        session_id=session_id,
+        tasks_store=tasks_store,
+        file_history=FileHistory(session_id=session_id),
+    )
+    print_welcome_banner("my-claude-code")
 
     try:
-        while True:
-            # 后台信息集中在下一次提示前显示，不与用户正在输入的文字交错。
-            for notice in memory_worker.notices:
-                console.print(notice, style="yellow", markup=False)
-            memory_worker.notices.clear()
-            # 读用户输入
-            user_input = await read_user_input(state)
-            if user_input is None:
-                # None 表示退出；空字符串表示只按了回车，二者含义不同。
-                break
-            if not user_input:
-                continue
+        # 转圈提示连接进度，否则冷启动拉包时用户会以为卡死了
+        with console.status("正在连接 MCP server..."):
+            mcp_summary = await mcp_servers.startup()
+        if mcp_summary:
+            console.print(mcp_summary + "\n")
 
-            try:
-                # 先清空临时日志，防止本地命令抛错时把上一轮用量再次累计。
-                api_call_log.clear()
-                # /new、/status 等命令在本地完成，不触发模型请求。
-                action = await handle_command(user_input, state)
-                if action == "break":
-                    break
-                if action == "continue":
-                    continue
+        # 常驻输入区：输入框整个会话期间不消失。task 面板通过 state.tasks_store 拉数据，所以 /new、/resume 换会话时不需要重新接线
+        repl = Repl(state)
 
-                result = await run_agent(user_input, state)
-                apply_result(state, result)
-                # 只用成功轮次的新用户消息提炼；失败轮次和已有历史不会反复保存。
-                memory_worker.schedule(result.new_messages())
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                # 用户主动中断不是工具故障，不自动重试，结束程序。
-                console.print("\n任务已中断，退出程序。")
-                break
-            except Exception as error:
-                # CLI 最外层安全网捕获未知错误；只中止本轮，不重新执行可能有副作用的工具。
-                # 历史仍保留上一轮成功状态，避免将未配对的工具调用传给下一轮模型。
-                state.last_api_calls = list(api_call_log)
-                state.input_tokens += sum(call.input_tokens for call in api_call_log)
-                state.output_tokens += sum(call.output_tokens for call in api_call_log)
-                print_run_error(error)
+        async def on_submit(user_input):
+            # 每次回车提交一行输入，都走这里
+            # 先处理 / 开头的命令
+            action = await handle_command(user_input, state)
+            if action == "break":
+                # 命令要求退出，结束常驻输入区
+                repl.exit()
+                return
+            if action == "continue":
+                return
 
+            # 发请求前检查上下文水位，越过阈值就先自动压缩再继续
+            await compact.auto_compact_if_needed(state)
+
+            # 建检查点：此刻 @ 引用和记忆召回还没注入，len(history) 就是干净的回退下标
+            state.file_history.make_checkpoint(len(state.history), user_input)
+
+            # 解析 @ 引用，把被引用的文件伪装成 read_file 调用塞进历史
+            inject_at_mentions(user_input, state)
+
+            # 核心 Agent 循环：开请求时显示 working...，结束 / 被打断后由 Repl 统一隐藏；中途按 ESC / Ctrl+C 会打断
+            repl.start_working()
+            # 召回相关记忆塞进历史，模型带着过去积累的经验处理本轮输入
+            await recall.inject_memories(user_input, state)
+            result = await run_agent_loop(user_input, state)
+            # 本轮结束后由后台提炼记忆，并顺带检查是否到了该定期合并的时候
+            background.schedule(state, result.new_messages())
+
+        await repl.run(on_submit)
     finally:
-        await memory_worker.finish()
-        for notice in memory_worker.notices:
-            console.print(notice, style="yellow", markup=False)
+        # 后台任务和 MCP 连接在正常退出、启动失败、取消时都能收尾。
+        try:
+            await background.drain()
+        finally:
+            await mcp_servers.shutdown()
 
 
-# 直接执行 python main.py 时启动交互；被其他模块导入时不自动进入主循环。
 if __name__ == "__main__":
-    # 创建事件循环来执行 async main()，程序退出时关闭事件循环。
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, EOFError):
+        pass
